@@ -3,162 +3,94 @@
 WORM directory abstraction.
 
 */
+
+#[cfg(feature = "mmap")]
 mod mmap_directory;
-mod ram_directory;
+
 mod directory;
-mod read_only_source;
-mod shared_vec_slice;
+mod directory_lock;
+mod footer;
 mod managed_directory;
+mod ram_directory;
+mod read_only_source;
+mod watch_event_router;
 
 /// Errors specific to the directory module.
 pub mod error;
 
-use std::io::{Write, Seek, BufWriter};
-
-pub use self::read_only_source::ReadOnlySource;
-pub use self::directory::Directory;
+pub use self::directory::DirectoryLock;
+pub use self::directory::{Directory, DirectoryClone};
+pub use self::directory_lock::{Lock, INDEX_WRITER_LOCK, META_LOCK};
 pub use self::ram_directory::RAMDirectory;
+pub use self::read_only_source::ReadOnlySource;
+pub use self::watch_event_router::{WatchCallback, WatchCallbackList, WatchHandle};
+use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
+/// Outcome of the Garbage collection
+pub struct GarbageCollectionResult {
+    /// List of files that were deleted in this cycle
+    pub deleted_files: Vec<PathBuf>,
+    /// List of files that were schedule to be deleted in this cycle,
+    /// but deletion did not work. This typically happens on windows,
+    /// as deleting a memory mapped file is forbidden.
+    ///
+    /// If a searcher is still held, a file cannot be deleted.
+    /// This is not considered a bug, the file will simply be deleted
+    /// in the next GC.
+    pub failed_to_delete_files: Vec<PathBuf>,
+}
+
+#[cfg(feature = "mmap")]
 pub use self::mmap_directory::MmapDirectory;
 
-pub(crate) use self::read_only_source::SourceRead;
-pub(crate) use self::managed_directory::{ManagedDirectory, FileProtection};
+pub use self::managed_directory::ManagedDirectory;
 
-/// Synonym of Seek + Write
-pub trait SeekableWrite: Seek + Write {}
-impl<T: Seek + Write> SeekableWrite for T {}
+/// Struct used to prevent from calling [`terminate_ref`](trait.TerminatingWrite#method.terminate_ref) directly
+///
+/// The point is that while the type is public, it cannot be built by anyone
+/// outside of this module.
+pub struct AntiCallToken(());
+
+/// Trait used to indicate when no more write need to be done on a writer
+pub trait TerminatingWrite: Write {
+    /// Indicate that the writer will no longer be used. Internally call terminate_ref.
+    fn terminate(mut self) -> io::Result<()>
+    where
+        Self: Sized,
+    {
+        self.terminate_ref(AntiCallToken(()))
+    }
+
+    /// You should implement this function to define custom behavior.
+    /// This function should flush any buffer it may hold.
+    fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()>;
+}
+
+impl<W: TerminatingWrite + ?Sized> TerminatingWrite for Box<W> {
+    fn terminate_ref(&mut self, token: AntiCallToken) -> io::Result<()> {
+        self.as_mut().terminate_ref(token)
+    }
+}
+
+impl<W: TerminatingWrite> TerminatingWrite for BufWriter<W> {
+    fn terminate_ref(&mut self, a: AntiCallToken) -> io::Result<()> {
+        self.flush()?;
+        self.get_mut().terminate_ref(a)
+    }
+}
+
+#[cfg(test)]
+impl<'a> TerminatingWrite for &'a mut Vec<u8> {
+    fn terminate_ref(&mut self, _a: AntiCallToken) -> io::Result<()> {
+        self.flush()
+    }
+}
 
 /// Write object for Directory.
 ///
 /// `WritePtr` are required to implement both Write
 /// and Seek.
-pub type WritePtr = BufWriter<Box<SeekableWrite>>;
+pub type WritePtr = BufWriter<Box<dyn TerminatingWrite>>;
 
 #[cfg(test)]
-mod tests {
-
-    use super::*;
-    use std::path::Path;
-    use std::io::{Write, Seek, SeekFrom};
-
-    lazy_static! {
-        static ref TEST_PATH: &'static Path = Path::new("some_path_for_test");
-    }
-
-    #[test]
-    fn test_ram_directory() {
-        let mut ram_directory = RAMDirectory::create();
-        test_directory(&mut ram_directory);
-    }
-
-    #[test]
-    fn test_mmap_directory() {
-        let mut mmap_directory = MmapDirectory::create_from_tempdir().unwrap();
-        test_directory(&mut mmap_directory);
-    }
-
-    #[test]
-    #[should_panic]
-    fn ram_directory_panics_if_flush_forgotten() {
-        let mut ram_directory = RAMDirectory::create();
-        let mut write_file = ram_directory.open_write(*TEST_PATH).unwrap();
-        assert!(write_file.write_all(&[4]).is_ok());
-    }
-
-    fn test_simple(directory: &mut Directory) {
-        {
-            {
-                let mut write_file = directory.open_write(*TEST_PATH).unwrap();
-                assert!(directory.exists(*TEST_PATH));
-                write_file.write_all(&[4]).unwrap();
-                write_file.write_all(&[3]).unwrap();
-                write_file.write_all(&[7, 3, 5]).unwrap();
-                write_file.flush().unwrap();
-            }
-            let read_file = directory.open_read(*TEST_PATH).unwrap();
-            let data: &[u8] = &*read_file;
-            assert_eq!(data, &[4u8, 3u8, 7u8, 3u8, 5u8]);
-        }
-
-        assert!(directory.delete(*TEST_PATH).is_ok());
-        assert!(!directory.exists(*TEST_PATH));
-    }
-
-    fn test_seek(directory: &mut Directory) {
-        {
-            {
-                let mut write_file = directory.open_write(*TEST_PATH).unwrap();
-                write_file.write_all(&[4, 3, 7, 3, 5]).unwrap();
-                write_file.seek(SeekFrom::Start(0)).unwrap();
-                write_file.write_all(&[3, 1]).unwrap();
-                write_file.flush().unwrap();
-            }
-            let read_file = directory.open_read(*TEST_PATH).unwrap();
-            let data: &[u8] = &*read_file;
-            assert_eq!(data, &[3u8, 1u8, 7u8, 3u8, 5u8]);
-        }
-
-        assert!(directory.delete(*TEST_PATH).is_ok());
-    }
-
-    fn test_rewrite_forbidden(directory: &mut Directory) {
-        {
-            directory.open_write(*TEST_PATH).unwrap();
-            assert!(directory.exists(*TEST_PATH));
-
-        }
-        {
-            assert!(directory.open_write(*TEST_PATH).is_err());
-        }
-        assert!(directory.delete(*TEST_PATH).is_ok());
-    }
-
-    fn test_write_create_the_file(directory: &mut Directory) {
-        {
-            assert!(directory.open_read(*TEST_PATH).is_err());
-            let _w = directory.open_write(*TEST_PATH).unwrap();
-            assert!(directory.exists(*TEST_PATH));
-            if let Err(e) = directory.open_read(*TEST_PATH) {
-                println!("{:?}", e);
-            }
-            assert!(directory.open_read(*TEST_PATH).is_ok());
-            assert!(directory.delete(*TEST_PATH).is_ok());
-        }
-    }
-
-    fn test_directory_delete(directory: &mut Directory) {
-        assert!(directory.open_read(*TEST_PATH).is_err());
-        let mut write_file = directory.open_write(*TEST_PATH).unwrap();
-        write_file.write_all(&[1, 2, 3, 4]).unwrap();
-        write_file.flush().unwrap();
-        {
-            let read_handle = directory.open_read(*TEST_PATH).unwrap();
-            {
-                assert_eq!(&*read_handle, &[1u8, 2u8, 3u8, 4u8]);
-
-                // Mapped files can't be deleted on Windows
-                if !cfg!(windows) {
-                    assert!(directory.delete(*TEST_PATH).is_ok());
-                    assert_eq!(&*read_handle, &[1u8, 2u8, 3u8, 4u8]);
-                }
-
-                assert!(directory.delete(Path::new("SomeOtherPath")).is_err());
-            }
-        }
-
-        if cfg!(windows) {
-            assert!(directory.delete(*TEST_PATH).is_ok());
-        }
-
-        assert!(directory.open_read(*TEST_PATH).is_err());
-        assert!(directory.delete(*TEST_PATH).is_err());
-    }
-
-    fn test_directory(directory: &mut Directory) {
-        test_simple(directory);
-        test_seek(directory);
-        test_rewrite_forbidden(directory);
-        test_write_create_the_file(directory);
-        test_directory_delete(directory);
-    }
-
-}
+mod tests;

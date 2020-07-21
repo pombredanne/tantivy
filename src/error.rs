@@ -2,139 +2,182 @@
 
 use std::io;
 
+use crate::directory::error::{IOError, OpenDirectoryError, OpenReadError, OpenWriteError};
+use crate::directory::error::{Incompatibility, LockError};
+use crate::fastfield::FastFieldNotAvailableError;
+use crate::query;
+use crate::schema;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::PoisonError;
-use directory::error::{IOError, OpenReadError, OpenWriteError, OpenDirectoryError};
-use query;
-use schema;
-use fastfield::FastFieldNotAvailableError;
-use serde_json;
 
+pub struct DataCorruption {
+    filepath: Option<PathBuf>,
+    comment: String,
+}
 
-error_chain!(
-    errors {
-        /// Path does not exist.
-        PathDoesNotExist(buf: PathBuf) {
-            description("path does not exist")
-            display("path does not exist: '{:?}'", buf)
-        }
-        /// File already exists, this is a problem when we try to write into a new file.
-        FileAlreadyExists(buf: PathBuf) {
-            description("file already exists")
-            display("file already exists: '{:?}'", buf)
-        }
-        /// IO Error.
-        IOError(err: IOError) {
-            description("an IO error occurred")
-            display("an IO error occurred: '{}'", err)
-        }
-        /// The data within is corrupted.
-        ///
-        /// For instance, it contains invalid JSON.
-        CorruptedFile(buf: PathBuf) {
-            description("file contains corrupted data")
-            display("file contains corrupted data: '{:?}'", buf)
-        }
-        /// A thread holding the locked panicked and poisoned the lock.
-        Poisoned {
-            description("a thread holding the locked panicked and poisoned the lock")
-        }
-        /// Invalid argument was passed by the user.
-        InvalidArgument(arg: String) {
-            description("an invalid argument was passed")
-            display("an invalid argument was passed: '{}'", arg)
-        }
-        /// An Error happened in one of the thread.
-        ErrorInThread(err: String) {
-            description("an error occurred in a thread")
-            display("an error occurred in a thread: '{}'", err)
-        }
-        /// An Error appeared related to the lack of a field.
-        SchemaError(field: String) {
-            description("a schema field is missing")
-            display("a schema field is missing: '{}'", field)
-        }
-        /// Tried to access a fastfield reader for a field not configured accordingly.
-        FastFieldError(err: FastFieldNotAvailableError) {
-            description("fast field not available")
-            display("fast field not available: '{:?}'", err)
+impl DataCorruption {
+    pub fn new(filepath: PathBuf, comment: String) -> DataCorruption {
+        DataCorruption {
+            filepath: Some(filepath),
+            comment,
         }
     }
-);
 
-impl From<FastFieldNotAvailableError> for Error {
-    fn from(fastfield_error: FastFieldNotAvailableError) -> Error {
-        ErrorKind::FastFieldError(fastfield_error).into()
+    pub fn comment_only(comment: String) -> DataCorruption {
+        DataCorruption {
+            filepath: None,
+            comment,
+        }
     }
 }
 
-impl From<IOError> for Error {
-    fn from(io_error: IOError) -> Error {
-        ErrorKind::IOError(io_error).into()
+impl fmt::Debug for DataCorruption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        write!(f, "Data corruption: ")?;
+        if let Some(ref filepath) = &self.filepath {
+            write!(f, "(in file `{:?}`)", filepath)?;
+        }
+        write!(f, ": {}.", self.comment)?;
+        Ok(())
     }
 }
 
-impl From<io::Error> for Error {
-    fn from(io_error: io::Error) -> Error {
-        ErrorKind::IOError(io_error.into()).into()
+/// The library's failure based error enum
+#[derive(Debug, Fail)]
+pub enum TantivyError {
+    /// Path does not exist.
+    #[fail(display = "Path does not exist: '{:?}'", _0)]
+    PathDoesNotExist(PathBuf),
+    /// File already exists, this is a problem when we try to write into a new file.
+    #[fail(display = "File already exists: '{:?}'", _0)]
+    FileAlreadyExists(PathBuf),
+    /// Index already exists in this directory
+    #[fail(display = "Index already exists")]
+    IndexAlreadyExists,
+    /// Failed to acquire file lock
+    #[fail(display = "Failed to acquire Lockfile: {:?}. {:?}", _0, _1)]
+    LockFailure(LockError, Option<String>),
+    /// IO Error.
+    #[fail(display = "An IO error occurred: '{}'", _0)]
+    IOError(#[cause] IOError),
+    /// Data corruption.
+    #[fail(display = "{:?}", _0)]
+    DataCorruption(DataCorruption),
+    /// A thread holding the locked panicked and poisoned the lock.
+    #[fail(display = "A thread holding the locked panicked and poisoned the lock")]
+    Poisoned,
+    /// Invalid argument was passed by the user.
+    #[fail(display = "An invalid argument was passed: '{}'", _0)]
+    InvalidArgument(String),
+    /// An Error happened in one of the thread.
+    #[fail(display = "An error occurred in a thread: '{}'", _0)]
+    ErrorInThread(String),
+    /// An Error appeared related to the schema.
+    #[fail(display = "Schema error: '{}'", _0)]
+    SchemaError(String),
+    /// System error. (e.g.: We failed spawning a new thread)
+    #[fail(display = "System error.'{}'", _0)]
+    SystemError(String),
+    /// Index incompatible with current version of tantivy
+    #[fail(display = "{:?}", _0)]
+    IncompatibleIndex(Incompatibility),
+}
+
+impl From<DataCorruption> for TantivyError {
+    fn from(data_corruption: DataCorruption) -> TantivyError {
+        TantivyError::DataCorruption(data_corruption)
     }
 }
 
-impl From<query::QueryParserError> for Error {
-    fn from(parsing_error: query::QueryParserError) -> Error {
-        ErrorKind::InvalidArgument(format!("Query is invalid. {:?}", parsing_error)).into()
+impl From<FastFieldNotAvailableError> for TantivyError {
+    fn from(fastfield_error: FastFieldNotAvailableError) -> TantivyError {
+        TantivyError::SchemaError(format!("{}", fastfield_error))
     }
 }
 
-impl<Guard> From<PoisonError<Guard>> for Error {
-    fn from(_: PoisonError<Guard>) -> Error {
-        ErrorKind::Poisoned.into()
+impl From<LockError> for TantivyError {
+    fn from(lock_error: LockError) -> TantivyError {
+        TantivyError::LockFailure(lock_error, None)
     }
 }
 
-impl From<OpenReadError> for Error {
-    fn from(error: OpenReadError) -> Error {
+impl From<IOError> for TantivyError {
+    fn from(io_error: IOError) -> TantivyError {
+        TantivyError::IOError(io_error)
+    }
+}
+
+impl From<io::Error> for TantivyError {
+    fn from(io_error: io::Error) -> TantivyError {
+        TantivyError::IOError(io_error.into())
+    }
+}
+
+impl From<query::QueryParserError> for TantivyError {
+    fn from(parsing_error: query::QueryParserError) -> TantivyError {
+        TantivyError::InvalidArgument(format!("Query is invalid. {:?}", parsing_error))
+    }
+}
+
+impl<Guard> From<PoisonError<Guard>> for TantivyError {
+    fn from(_: PoisonError<Guard>) -> TantivyError {
+        TantivyError::Poisoned
+    }
+}
+
+impl From<OpenReadError> for TantivyError {
+    fn from(error: OpenReadError) -> TantivyError {
         match error {
-            OpenReadError::FileDoesNotExist(filepath) => {
-                ErrorKind::PathDoesNotExist(filepath).into()
+            OpenReadError::FileDoesNotExist(filepath) => TantivyError::PathDoesNotExist(filepath),
+            OpenReadError::IOError(io_error) => TantivyError::IOError(io_error),
+            OpenReadError::IncompatibleIndex(incompatibility) => {
+                TantivyError::IncompatibleIndex(incompatibility)
             }
-            OpenReadError::IOError(io_error) => ErrorKind::IOError(io_error).into(),
         }
     }
 }
 
-impl From<schema::DocParsingError> for Error {
-    fn from(error: schema::DocParsingError) -> Error {
-        ErrorKind::InvalidArgument(format!("Failed to parse document {:?}", error)).into()
+impl From<schema::DocParsingError> for TantivyError {
+    fn from(error: schema::DocParsingError) -> TantivyError {
+        TantivyError::InvalidArgument(format!("Failed to parse document {:?}", error))
     }
 }
 
-impl From<OpenWriteError> for Error {
-    fn from(error: OpenWriteError) -> Error {
+impl From<OpenWriteError> for TantivyError {
+    fn from(error: OpenWriteError) -> TantivyError {
         match error {
-            OpenWriteError::FileAlreadyExists(filepath) => ErrorKind::FileAlreadyExists(filepath),
-            OpenWriteError::IOError(io_error) => ErrorKind::IOError(io_error),
-        }.into()
+            OpenWriteError::FileAlreadyExists(filepath) => {
+                TantivyError::FileAlreadyExists(filepath)
+            }
+            OpenWriteError::IOError(io_error) => TantivyError::IOError(io_error),
+        }
     }
 }
 
-impl From<OpenDirectoryError> for Error {
-    fn from(error: OpenDirectoryError) -> Error {
+impl From<OpenDirectoryError> for TantivyError {
+    fn from(error: OpenDirectoryError) -> TantivyError {
         match error {
             OpenDirectoryError::DoesNotExist(directory_path) => {
-                ErrorKind::PathDoesNotExist(directory_path).into()
+                TantivyError::PathDoesNotExist(directory_path)
             }
             OpenDirectoryError::NotADirectory(directory_path) => {
-                ErrorKind::InvalidArgument(format!("{:?} is not a directory", directory_path))
-                    .into()
+                TantivyError::InvalidArgument(format!("{:?} is not a directory", directory_path))
             }
+            OpenDirectoryError::IoError(err) => TantivyError::IOError(IOError::from(err)),
         }
     }
 }
 
-impl From<serde_json::Error> for Error {
-    fn from(error: serde_json::Error) -> Error {
+impl From<serde_json::Error> for TantivyError {
+    fn from(error: serde_json::Error) -> TantivyError {
         let io_err = io::Error::from(error);
-        ErrorKind::IOError(io_err.into()).into()
+        TantivyError::IOError(io_err.into())
+    }
+}
+
+impl From<rayon::ThreadPoolBuildError> for TantivyError {
+    fn from(error: rayon::ThreadPoolBuildError) -> TantivyError {
+        TantivyError::SystemError(error.to_string())
     }
 }

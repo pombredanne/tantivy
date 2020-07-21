@@ -1,3 +1,5 @@
+tantivy.iml
+*.swp
 target
 target/debug
 .vscode

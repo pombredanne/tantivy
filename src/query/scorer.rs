@@ -1,62 +1,75 @@
-use DocSet;
-use DocId;
-use Score;
-use collector::Collector;
-use std::ops::{Deref, DerefMut};
+use crate::docset::DocSet;
+use crate::DocId;
+use crate::Score;
+use downcast_rs::impl_downcast;
+use std::ops::DerefMut;
 
 /// Scored set of documents matching a query within a specific segment.
 ///
 /// See [`Query`](./trait.Query.html).
-pub trait Scorer: DocSet {
+pub trait Scorer: downcast_rs::Downcast + DocSet + 'static {
     /// Returns the score.
     ///
     /// This method will perform a bit of computation and is not cached.
-    fn score(&self) -> Score;
+    fn score(&mut self) -> Score;
+}
 
-    /// Consumes the complete `DocSet` and
-    /// push the scored documents to the collector.
-    fn collect(&mut self, collector: &mut Collector) {
-        while self.advance() {
-            collector.collect(self.doc(), self.score());
-        }
+impl_downcast!(Scorer);
+
+impl Scorer for Box<dyn Scorer> {
+    fn score(&mut self) -> Score {
+        self.deref_mut().score()
     }
 }
 
-
-impl<'a> Scorer for Box<Scorer + 'a> {
-    fn score(&self) -> Score {
-        self.deref().score()
-    }
-
-    fn collect(&mut self, collector: &mut Collector) {
-        let scorer = self.deref_mut();
-        while scorer.advance() {
-            collector.collect(scorer.doc(), scorer.score());
-        }
-    }
-}
-
-/// `EmptyScorer` is a dummy `Scorer` in which no document matches.
+/// Wraps a `DocSet` and simply returns a constant `Scorer`.
+/// The `ConstScorer` is useful if you have a `DocSet` where
+/// you needed a scorer.
 ///
-/// It is useful for tests and handling edge cases.
-pub struct EmptyScorer;
+/// The `ConstScorer`'s constant score can be set
+/// by calling `.set_score(...)`.
+pub struct ConstScorer<TDocSet: DocSet> {
+    docset: TDocSet,
+    score: Score,
+}
 
-impl DocSet for EmptyScorer {
-    fn advance(&mut self) -> bool {
-        false
+impl<TDocSet: DocSet> ConstScorer<TDocSet> {
+    /// Creates a new `ConstScorer`.
+    pub fn new(docset: TDocSet, score: f32) -> ConstScorer<TDocSet> {
+        ConstScorer { docset, score }
+    }
+}
+
+impl<TDocSet: DocSet> From<TDocSet> for ConstScorer<TDocSet> {
+    fn from(docset: TDocSet) -> Self {
+        ConstScorer::new(docset, 1.0f32)
+    }
+}
+
+impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
+    fn advance(&mut self) -> DocId {
+        self.docset.advance()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.docset.seek(target)
+    }
+
+    fn fill_buffer(&mut self, buffer: &mut [DocId]) -> usize {
+        self.docset.fill_buffer(buffer)
     }
 
     fn doc(&self) -> DocId {
-        DocId::max_value()
+        self.docset.doc()
     }
 
-    fn size_hint(&self) -> usize {
-        0
+    fn size_hint(&self) -> u32 {
+        self.docset.size_hint()
     }
 }
 
-impl Scorer for EmptyScorer {
-    fn score(&self) -> Score {
-        0f32
+impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {
+    fn score(&mut self) -> Score {
+        self.score
     }
 }

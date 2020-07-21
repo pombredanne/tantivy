@@ -1,8 +1,8 @@
 use super::operation::DeleteOperation;
-use std::sync::{Arc, RwLock};
+use crate::Opstamp;
 use std::mem;
 use std::ops::DerefMut;
-
+use std::sync::{Arc, RwLock, Weak};
 
 // The DeleteQueue is similar in conceptually to a multiple
 // consumer single producer broadcast channel.
@@ -14,56 +14,58 @@ use std::ops::DerefMut;
 //
 // New consumer can be created in two ways
 // - calling `delete_queue.cursor()` returns a cursor, that
-//   will include all future delete operation (and no past operations).
+//   will include all future delete operation (and some or none
+//   of the past operations... The client is in charge of checking the opstamps.).
 // - cloning an existing cursor returns a new cursor, that
-//   is at the exact same position, and can now advance independantly
+//   is at the exact same position, and can now advance independently
 //   from the original cursor.
 #[derive(Default)]
 struct InnerDeleteQueue {
     writer: Vec<DeleteOperation>,
-    last_block: Option<Arc<Block>>,
+    last_block: Weak<Block>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DeleteQueue {
     inner: Arc<RwLock<InnerDeleteQueue>>,
 }
 
-
 impl DeleteQueue {
     // Creates a new delete queue.
     pub fn new() -> DeleteQueue {
-
-        let delete_queue = DeleteQueue { inner: Arc::default() };
-
-        let next_block = NextBlock::from(delete_queue.clone());
-        {
-            let mut delete_queue_wlock = delete_queue.inner.write().unwrap();
-            delete_queue_wlock.last_block = Some(Arc::new(Block {
-                operations: Arc::default(),
-                next: next_block,
-            }));
+        DeleteQueue {
+            inner: Arc::default(),
         }
-
-        delete_queue
     }
 
+    fn get_last_block(&self) -> Arc<Block> {
+        {
+            // try get the last block with simply acquiring the read lock.
+            let rlock = self.inner.read().unwrap();
+            if let Some(block) = rlock.last_block.upgrade() {
+                return block;
+            }
+        }
+        // It failed. Let's double check after acquiring the write, as someone could have called
+        // `get_last_block` right after we released the rlock.
+        let mut wlock = self.inner.write().unwrap();
+        if let Some(block) = wlock.last_block.upgrade() {
+            return block;
+        }
+        let block = Arc::new(Block {
+            operations: Arc::default(),
+            next: NextBlock::from(self.clone()),
+        });
+        wlock.last_block = Arc::downgrade(&block);
+        block
+    }
 
     // Creates a new cursor that makes it possible to
     // consume future delete operations.
     //
     // Past delete operations are not accessible.
     pub fn cursor(&self) -> DeleteCursor {
-        let last_block = self.inner
-            .read()
-            .expect("Read lock poisoned when opening delete queue cursor")
-            .last_block
-            .clone()
-            .expect(
-                "Failed to unwrap last_block. This should never happen
-                as the Option<> is only here to make
-                initialization possible",
-            );
+        let last_block = self.get_last_block();
         let operations_len = last_block.operations.len();
         DeleteCursor {
             block: last_block,
@@ -94,27 +96,24 @@ impl DeleteQueue {
     // be some unflushed operations.
     //
     fn flush(&self) -> Option<Arc<Block>> {
-        let mut self_wlock = self.inner.write().expect(
-            "Failed to acquire write lock on delete queue writer",
-        );
+        let mut self_wlock = self
+            .inner
+            .write()
+            .expect("Failed to acquire write lock on delete queue writer");
 
-        let delete_operations;
-        {
-            let writer: &mut Vec<DeleteOperation> = &mut self_wlock.writer;
-            if writer.is_empty() {
-                return None;
-            }
-            delete_operations = mem::replace(writer, vec![]);
+        if self_wlock.writer.is_empty() {
+            return None;
         }
 
-        let next_block = NextBlock::from(self.clone());
-        {
-            self_wlock.last_block = Some(Arc::new(Block {
-                operations: Arc::new(delete_operations),
-                next: next_block,
-            }));
-        }
-        self_wlock.last_block.clone()
+        let delete_operations = mem::replace(&mut self_wlock.writer, vec![]);
+
+        let new_block = Arc::new(Block {
+            operations: Arc::new(delete_operations.into_boxed_slice()),
+            next: NextBlock::from(self.clone()),
+        });
+
+        self_wlock.last_block = Arc::downgrade(&new_block);
+        Some(new_block)
     }
 }
 
@@ -134,44 +133,43 @@ impl From<DeleteQueue> for NextBlock {
 impl NextBlock {
     fn next_block(&self) -> Option<Arc<Block>> {
         {
-            let next_read_lock = self.0.read().expect(
-                "Failed to acquire write lock in delete queue",
-            );
+            let next_read_lock = self
+                .0
+                .read()
+                .expect("Failed to acquire write lock in delete queue");
             if let InnerNextBlock::Closed(ref block) = *next_read_lock {
-                return Some(block.clone());
+                return Some(Arc::clone(block));
             }
         }
         let next_block;
         {
-            let mut next_write_lock = self.0.write().expect(
-                "Failed to acquire write lock in delete queue",
-            );
+            let mut next_write_lock = self
+                .0
+                .write()
+                .expect("Failed to acquire write lock in delete queue");
             match *next_write_lock {
                 InnerNextBlock::Closed(ref block) => {
-                    return Some(block.clone());
+                    return Some(Arc::clone(block));
                 }
-                InnerNextBlock::Writer(ref writer) => {
-                    match writer.flush() {
-                        Some(flushed_next_block) => {
-                            next_block = flushed_next_block;
-                        }
-                        None => {
-                            return None;
-                        }
+                InnerNextBlock::Writer(ref writer) => match writer.flush() {
+                    Some(flushed_next_block) => {
+                        next_block = flushed_next_block;
                     }
-                }
+                    None => {
+                        return None;
+                    }
+                },
             }
-            *next_write_lock.deref_mut() = InnerNextBlock::Closed(next_block.clone());
+            *next_write_lock.deref_mut() = InnerNextBlock::Closed(Arc::clone(&next_block));
             Some(next_block)
         }
     }
 }
 
 struct Block {
-    operations: Arc<Vec<DeleteOperation>>,
+    operations: Arc<Box<[DeleteOperation]>>,
     next: NextBlock,
 }
-
 
 #[derive(Clone)]
 pub struct DeleteCursor {
@@ -179,26 +177,24 @@ pub struct DeleteCursor {
     pos: usize,
 }
 
-
 impl DeleteCursor {
     /// Skips operations and position it so that
     /// - either all of the delete operation currently in the
     ///   queue are consume and the next get will return None.
     /// - the next get will return the first operation with an
     /// `opstamp >= target_opstamp`.
-    pub fn skip_to(&mut self, target_opstamp: u64) {
+    pub fn skip_to(&mut self, target_opstamp: Opstamp) {
         // TODO Can be optimize as we work with block.
-        #[cfg_attr(feature = "cargo-clippy", allow(while_let_loop))]
-        loop {
-            if let Some(operation) = self.get() {
-                if operation.opstamp >= target_opstamp {
-                    break;
-                }
-            } else {
-                break;
-            }
+        while self.is_behind_opstamp(target_opstamp) {
             self.advance();
         }
+    }
+
+    #[cfg_attr(feature = "cargo-clippy", allow(clippy::wrong_self_convention))]
+    fn is_behind_opstamp(&mut self, target_opstamp: Opstamp) -> bool {
+        self.get()
+            .map(|operation| operation.opstamp < target_opstamp)
+            .unwrap_or(false)
     }
 
     /// If the current block has been entirely
@@ -248,23 +244,18 @@ impl DeleteCursor {
     }
 }
 
-
-
-
-
-
 #[cfg(test)]
 mod tests {
 
-    use super::{DeleteQueue, DeleteOperation};
-    use schema::{Term, Field};
+    use super::{DeleteOperation, DeleteQueue};
+    use crate::schema::{Field, Term};
 
     #[test]
     fn test_deletequeue() {
         let delete_queue = DeleteQueue::new();
 
         let make_op = |i: usize| {
-            let field = Field(1u32);
+            let field = Field::from_field_id(1u32);
             DeleteOperation {
                 opstamp: i as u64,
                 term: Term::from_field_u64(field, i as u64),
@@ -304,6 +295,5 @@ mod tests {
             operations_it.advance();
             assert!(operations_it.get().is_none());
         }
-
     }
 }

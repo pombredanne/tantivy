@@ -1,54 +1,116 @@
-use Term;
-use query::Weight;
-use core::SegmentReader;
-use query::Scorer;
-use postings::SegmentPostings;
-use schema::IndexRecordOption;
 use super::term_scorer::TermScorer;
-use Result;
+use crate::core::SegmentReader;
+use crate::docset::DocSet;
+use crate::postings::SegmentPostings;
+use crate::query::bm25::BM25Weight;
+use crate::query::explanation::does_not_match;
+use crate::query::weight::{for_each_pruning_scorer, for_each_scorer};
+use crate::query::Weight;
+use crate::query::{Explanation, Scorer};
+use crate::schema::IndexRecordOption;
+use crate::Result;
+use crate::Term;
+use crate::{DocId, Score};
 
 pub struct TermWeight {
-    pub(crate) num_docs: u32,
-    pub(crate) doc_freq: u32,
-    pub(crate) term: Term,
-    pub(crate) index_record_option: IndexRecordOption,
+    term: Term,
+    index_record_option: IndexRecordOption,
+    similarity_weight: BM25Weight,
 }
 
-
 impl Weight for TermWeight {
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader) -> Result<Box<Scorer + 'a>> {
-        let specialized_scorer = self.specialized_scorer(reader)?;
-        Ok(box specialized_scorer)
+    fn scorer(&self, reader: &SegmentReader, boost: f32) -> Result<Box<dyn Scorer>> {
+        let term_scorer = self.specialized_scorer(reader, boost)?;
+        Ok(Box::new(term_scorer))
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation> {
+        let mut scorer = self.specialized_scorer(reader, 1.0f32)?;
+        if scorer.seek(doc) != doc {
+            return Err(does_not_match(doc));
+        }
+        Ok(scorer.explain())
+    }
+
+    fn count(&self, reader: &SegmentReader) -> Result<u32> {
+        if let Some(delete_bitset) = reader.delete_bitset() {
+            Ok(self.scorer(reader, 1.0f32)?.count(delete_bitset))
+        } else {
+            let field = self.term.field();
+            Ok(reader
+                .inverted_index(field)
+                .get_term_info(&self.term)
+                .map(|term_info| term_info.doc_freq)
+                .unwrap_or(0))
+        }
+    }
+
+    /// Iterates through all of the document matched by the DocSet
+    /// `DocSet` and push the scored documents to the collector.
+    fn for_each(
+        &self,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(DocId, Score),
+    ) -> crate::Result<()> {
+        let mut scorer = self.specialized_scorer(reader, 1.0f32)?;
+        for_each_scorer(&mut scorer, callback);
+        Ok(())
+    }
+
+    /// Calls `callback` with all of the `(doc, score)` for which score
+    /// is exceeding a given threshold.
+    ///
+    /// This method is useful for the TopDocs collector.
+    /// For all docsets, the blanket implementation has the benefit
+    /// of prefiltering (doc, score) pairs, avoiding the
+    /// virtual dispatch cost.
+    ///
+    /// More importantly, it makes it possible for scorers to implement
+    /// important optimization (e.g. BlockWAND for union).
+    fn for_each_pruning(
+        &self,
+        threshold: f32,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(DocId, Score) -> Score,
+    ) -> crate::Result<()> {
+        let mut scorer = self.scorer(reader, 1.0f32)?;
+        for_each_pruning_scorer(&mut scorer, threshold, callback);
+        Ok(())
     }
 }
 
 impl TermWeight {
-    fn idf(&self) -> f32 {
-        1.0 + (self.num_docs as f32 / (self.doc_freq as f32 + 1.0)).ln()
+    pub fn new(
+        term: Term,
+        index_record_option: IndexRecordOption,
+        similarity_weight: BM25Weight,
+    ) -> TermWeight {
+        TermWeight {
+            term,
+            index_record_option,
+            similarity_weight,
+        }
     }
 
-    /// If the field is not found, returns an empty `DocSet`.
-    pub fn specialized_scorer(
-        &self,
-        reader: &SegmentReader,
-    ) -> Result<TermScorer<SegmentPostings>> {
+    fn specialized_scorer(&self, reader: &SegmentReader, boost: f32) -> Result<TermScorer> {
         let field = self.term.field();
         let inverted_index = reader.inverted_index(field);
-        let fieldnorm_reader_opt = reader.get_fieldnorms_reader(field);
+        let fieldnorm_reader = reader.get_fieldnorms_reader(field);
+        let similarity_weight = self.similarity_weight.boost_by(boost);
         let postings_opt: Option<SegmentPostings> =
             inverted_index.read_postings(&self.term, self.index_record_option);
         if let Some(segment_postings) = postings_opt {
-            Ok(TermScorer {
-                idf: self.idf(),
-                fieldnorm_reader_opt: fieldnorm_reader_opt,
-                postings: segment_postings,
-            })
+            Ok(TermScorer::new(
+                segment_postings,
+                fieldnorm_reader,
+                similarity_weight,
+            ))
         } else {
-            Ok(TermScorer {
-                idf: 1f32,
-                fieldnorm_reader_opt: None,
-                postings: SegmentPostings::empty(),
-            })
+            Ok(TermScorer::new(
+                SegmentPostings::empty(),
+                fieldnorm_reader,
+                similarity_weight,
+            ))
         }
     }
 }

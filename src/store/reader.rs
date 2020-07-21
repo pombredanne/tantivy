@@ -1,16 +1,14 @@
-use Result;
-
-use directory::ReadOnlySource;
+use super::decompress;
+use super::skiplist::SkipList;
+use crate::common::BinarySerializable;
+use crate::common::VInt;
+use crate::directory::ReadOnlySource;
+use crate::schema::Document;
+use crate::space_usage::StoreSpaceUsage;
+use crate::DocId;
 use std::cell::RefCell;
-use DocId;
-use schema::Document;
-use schema::FieldValue;
-use common::BinarySerializable;
+use std::io;
 use std::mem::size_of;
-use std::io::{self, Read};
-use datastruct::SkipList;
-use lz4;
-
 
 /// Reads document off tantivy's [`Store`](./index.html)
 #[derive(Clone)]
@@ -28,31 +26,41 @@ impl StoreReader {
         let (data_source, offset_index_source, max_doc) = split_source(data);
         StoreReader {
             data: data_source,
-            offset_index_source: offset_index_source,
+            offset_index_source,
             current_block_offset: RefCell::new(usize::max_value()),
             current_block: RefCell::new(Vec::new()),
-            max_doc: max_doc,
+            max_doc,
         }
     }
 
-    fn block_offset(&self, doc_id: DocId) -> (DocId, u64) {
+    pub(crate) fn block_index(&self) -> SkipList<'_, u64> {
         SkipList::from(self.offset_index_source.as_slice())
-            .seek(doc_id + 1)
+    }
+
+    fn block_offset(&self, doc_id: DocId) -> (DocId, u64) {
+        self.block_index()
+            .seek(u64::from(doc_id) + 1)
+            .map(|(doc, offset)| (doc as DocId, offset))
             .unwrap_or((0u32, 0u64))
+    }
+
+    pub(crate) fn block_data(&self) -> &[u8] {
+        self.data.as_slice()
+    }
+
+    fn compressed_block(&self, addr: usize) -> &[u8] {
+        let total_buffer = self.data.as_slice();
+        let mut buffer = &total_buffer[addr..];
+        let block_len = u32::deserialize(&mut buffer).expect("") as usize;
+        &buffer[..block_len]
     }
 
     fn read_block(&self, block_offset: usize) -> io::Result<()> {
         if block_offset != *self.current_block_offset.borrow() {
             let mut current_block_mut = self.current_block.borrow_mut();
             current_block_mut.clear();
-            let total_buffer = self.data.as_slice();
-            let mut cursor = &total_buffer[block_offset..];
-            let block_length = u32::deserialize(&mut cursor).unwrap();
-            let block_array: &[u8] = &total_buffer[(block_offset + 4 as usize)..
-                                                       (block_offset + 4 + block_length as usize)];
-            let mut lz4_decoder = try!(lz4::Decoder::new(block_array));
-            *self.current_block_offset.borrow_mut() = usize::max_value();
-            try!(lz4_decoder.read_to_end(&mut current_block_mut).map(|_| ()));
+            let compressed_block = self.compressed_block(block_offset);
+            decompress(compressed_block, &mut current_block_mut)?;
             *self.current_block_offset.borrow_mut() = block_offset;
         }
         Ok(())
@@ -65,27 +73,26 @@ impl StoreReader {
     ///
     /// It should not be called to score documents
     /// for instance.
-    pub fn get(&self, doc_id: DocId) -> Result<Document> {
+    pub fn get(&self, doc_id: DocId) -> crate::Result<Document> {
         let (first_doc_id, block_offset) = self.block_offset(doc_id);
         self.read_block(block_offset as usize)?;
         let current_block_mut = self.current_block.borrow_mut();
         let mut cursor = &current_block_mut[..];
         for _ in first_doc_id..doc_id {
-            let block_length = try!(u32::deserialize(&mut cursor));
-            cursor = &cursor[block_length as usize..];
+            let doc_length = VInt::deserialize(&mut cursor)?.val() as usize;
+            cursor = &cursor[doc_length..];
         }
-        u32::deserialize(&mut cursor)?;
-        let num_fields = u32::deserialize(&mut cursor)?;
-        let mut field_values = Vec::new();
-        for _ in 0..num_fields {
-            let field_value = FieldValue::deserialize(&mut cursor)?;
-            field_values.push(field_value);
-        }
-        Ok(Document::from(field_values))
+        let doc_length = VInt::deserialize(&mut cursor)?.val() as usize;
+        cursor = &cursor[..doc_length];
+        Ok(Document::deserialize(&mut cursor)?)
+    }
+
+    /// Summarize total space usage of this store reader.
+    pub fn space_usage(&self) -> StoreSpaceUsage {
+        StoreSpaceUsage::new(self.data.len(), self.offset_index_source.len())
     }
 }
 
-#[allow(needless_pass_by_value)]
 fn split_source(data: ReadOnlySource) -> (ReadOnlySource, ReadOnlySource, DocId) {
     let data_len = data.len();
     let footer_offset = data_len - size_of::<u64>() - size_of::<u32>();

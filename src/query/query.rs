@@ -1,12 +1,11 @@
-use Result;
-use collector::Collector;
-use core::searcher::Searcher;
-use common::TimerTree;
-use SegmentLocalId;
 use super::Weight;
+use crate::core::searcher::Searcher;
+use crate::query::Explanation;
+use crate::DocAddress;
+use crate::Term;
+use downcast_rs::impl_downcast;
+use std::collections::BTreeSet;
 use std::fmt;
-use std::any::Any;
-
 
 /// The `Query` trait defines a set of documents and a scoring method
 /// for those documents.
@@ -41,46 +40,68 @@ use std::any::Any;
 ///
 /// When implementing a new type of `Query`, it is normal to implement a
 /// dedicated `Query`, `Weight` and `Scorer`.
-pub trait Query: fmt::Debug {
-    /// Used to make it possible to cast Box<Query>
-    /// into a specific type. This is mostly useful for unit tests.
-    fn as_any(&self) -> &Any;
-
+pub trait Query: QueryClone + downcast_rs::Downcast + fmt::Debug {
     /// Create the weight associated to a query.
     ///
+    /// If scoring is not required, setting `scoring_enabled` to `false`
+    /// can increase performances.
+    ///
     /// See [`Weight`](./trait.Weight.html).
-    fn weight(&self, searcher: &Searcher) -> Result<Box<Weight>>;
+    fn weight(&self, searcher: &Searcher, scoring_enabled: bool) -> crate::Result<Box<dyn Weight>>;
 
-    /// Search works as follows :
-    ///
-    /// First the weight object associated to the query is created.
-    ///
-    /// Then, the query loops over the segments and for each segment :
-    /// - setup the collector and informs it that the segment being processed has changed.
-    /// - creates a `Scorer` object associated for this segment
-    /// - iterate throw the matched documents and push them to the collector.
-    ///
-    fn search(&self, searcher: &Searcher, collector: &mut Collector) -> Result<TimerTree> {
-        let mut timer_tree = TimerTree::default();
-        let weight = try!(self.weight(searcher));
-        {
-            let mut search_timer = timer_tree.open("search");
-            for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
-                let mut segment_search_timer = search_timer.open("segment_search");
-                {
-                    let _ = segment_search_timer.open("set_segment");
-                    try!(collector.set_segment(
-                        segment_ord as SegmentLocalId,
-                        segment_reader,
-                    ));
-                }
-                let mut scorer = try!(weight.scorer(segment_reader));
-                {
-                    let _collection_timer = segment_search_timer.open("collection");
-                    scorer.collect(collector);
-                }
-            }
+    /// Returns an `Explanation` for the score of the document.
+    fn explain(&self, searcher: &Searcher, doc_address: DocAddress) -> crate::Result<Explanation> {
+        let reader = searcher.segment_reader(doc_address.segment_ord());
+        let weight = self.weight(searcher, true)?;
+        weight.explain(reader, doc_address.doc())
+    }
+
+    /// Returns the number of documents matching the query.
+    fn count(&self, searcher: &Searcher) -> crate::Result<usize> {
+        let weight = self.weight(searcher, false)?;
+        let mut result = 0;
+        for reader in searcher.segment_readers() {
+            result += weight.count(reader)? as usize;
         }
-        Ok(timer_tree)
+        Ok(result)
+    }
+
+    /// Extract all of the terms associated to the query and insert them in the
+    /// term set given in arguments.
+    fn query_terms(&self, _term_set: &mut BTreeSet<Term>) {}
+}
+
+pub trait QueryClone {
+    fn box_clone(&self) -> Box<dyn Query>;
+}
+
+impl<T> QueryClone for T
+where
+    T: 'static + Query + Clone,
+{
+    fn box_clone(&self) -> Box<dyn Query> {
+        Box::new(self.clone())
     }
 }
+
+impl Query for Box<dyn Query> {
+    fn weight(&self, searcher: &Searcher, scoring_enabled: bool) -> crate::Result<Box<dyn Weight>> {
+        self.as_ref().weight(searcher, scoring_enabled)
+    }
+
+    fn count(&self, searcher: &Searcher) -> crate::Result<usize> {
+        self.as_ref().count(searcher)
+    }
+
+    fn query_terms(&self, term_set: &mut BTreeSet<Term<Vec<u8>>>) {
+        self.as_ref().query_terms(term_set);
+    }
+}
+
+impl QueryClone for Box<dyn Query> {
+    fn box_clone(&self) -> Box<dyn Query> {
+        self.as_ref().box_clone()
+    }
+}
+
+impl_downcast!(Query);

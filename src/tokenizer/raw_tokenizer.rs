@@ -1,5 +1,5 @@
-use super::{Token, Tokenizer, TokenStream};
-
+use super::{Token, TokenStream, Tokenizer};
+use crate::tokenizer::BoxTokenStream;
 
 /// For each value of the field, emit a single unprocessed token.
 #[derive(Clone)]
@@ -10,31 +10,28 @@ pub struct RawTokenStream {
     has_token: bool,
 }
 
-impl<'a> Tokenizer<'a> for RawTokenizer {
-    type TokenStreamImpl = RawTokenStream;
-
-    fn token_stream(&self, text: &'a str) -> Self::TokenStreamImpl {
+impl Tokenizer for RawTokenizer {
+    fn token_stream<'a>(&self, text: &'a str) -> BoxTokenStream<'a> {
         let token = Token {
             offset_from: 0,
             offset_to: text.len(),
             position: 0,
             text: text.to_string(),
+            position_length: 1,
         };
         RawTokenStream {
-            token: token,
+            token,
             has_token: true,
         }
+        .into()
     }
 }
 
 impl TokenStream for RawTokenStream {
     fn advance(&mut self) -> bool {
-        if self.has_token {
-            self.has_token = false;
-            true
-        } else {
-            false
-        }
+        let result = self.has_token;
+        self.has_token = false;
+        result
     }
 
     fn token(&self) -> &Token {

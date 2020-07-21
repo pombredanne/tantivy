@@ -1,14 +1,12 @@
-use directory::{SourceRead, ReadOnlySource};
-use termdict::{TermDictionary, TermDictionaryImpl};
-use postings::{SegmentPostings, BlockSegmentPostings};
-use postings::TermInfo;
-use schema::IndexRecordOption;
-use schema::Term;
-use std::cmp;
-use fastfield::DeleteBitSet;
-use schema::Schema;
-use compression::CompressedIntStream;
-
+use crate::common::BinarySerializable;
+use crate::directory::ReadOnlySource;
+use crate::positions::PositionReader;
+use crate::postings::TermInfo;
+use crate::postings::{BlockSegmentPostings, SegmentPostings};
+use crate::schema::FieldType;
+use crate::schema::IndexRecordOption;
+use crate::schema::Term;
+use crate::termdict::TermDictionary;
 
 /// The inverted index reader is in charge of accessing
 /// the inverted index associated to a specific field.
@@ -24,39 +22,59 @@ use compression::CompressedIntStream;
 /// `InvertedIndexReader` are created by calling
 /// the `SegmentReader`'s [`.inverted_index(...)`] method
 pub struct InvertedIndexReader {
-    termdict: TermDictionaryImpl,
+    termdict: TermDictionary,
     postings_source: ReadOnlySource,
     positions_source: ReadOnlySource,
-    delete_bitset: DeleteBitSet,
-    schema: Schema,
+    positions_idx_source: ReadOnlySource,
+    record_option: IndexRecordOption,
+    total_num_tokens: u64,
 }
 
 impl InvertedIndexReader {
+    #[cfg_attr(feature = "cargo-clippy", allow(clippy::needless_pass_by_value))] // for symmetry
     pub(crate) fn new(
-        termdict_source: ReadOnlySource,
+        termdict: TermDictionary,
         postings_source: ReadOnlySource,
         positions_source: ReadOnlySource,
-        delete_bitset: DeleteBitSet,
-        schema: Schema,
+        positions_idx_source: ReadOnlySource,
+        record_option: IndexRecordOption,
     ) -> InvertedIndexReader {
-
+        let total_num_tokens_data = postings_source.slice(0, 8);
+        let mut total_num_tokens_cursor = total_num_tokens_data.as_slice();
+        let total_num_tokens = u64::deserialize(&mut total_num_tokens_cursor).unwrap_or(0u64);
         InvertedIndexReader {
-            termdict: TermDictionaryImpl::from_source(termdict_source),
-            postings_source: postings_source,
-            positions_source: positions_source,
-            delete_bitset: delete_bitset,
-            schema: schema,
+            termdict,
+            postings_source: postings_source.slice_from(8),
+            positions_source,
+            positions_idx_source,
+            record_option,
+            total_num_tokens,
+        }
+    }
+
+    /// Creates an empty `InvertedIndexReader` object, which
+    /// contains no terms at all.
+    pub fn empty(field_type: &FieldType) -> InvertedIndexReader {
+        let record_option = field_type
+            .get_index_record_option()
+            .unwrap_or(IndexRecordOption::Basic);
+        InvertedIndexReader {
+            termdict: TermDictionary::empty(),
+            postings_source: ReadOnlySource::empty(),
+            positions_source: ReadOnlySource::empty(),
+            positions_idx_source: ReadOnlySource::empty(),
+            record_option,
+            total_num_tokens: 0u64,
         }
     }
 
     /// Returns the term info associated with the term.
     pub fn get_term_info(&self, term: &Term) -> Option<TermInfo> {
-        self.termdict.get(term.as_slice())
+        self.termdict.get(term.value_bytes())
     }
 
-
     /// Return the term dictionary datastructure.
-    pub fn terms(&self) -> &TermDictionaryImpl {
+    pub fn terms(&self) -> &TermDictionary {
         &self.termdict
     }
 
@@ -78,11 +96,21 @@ impl InvertedIndexReader {
         let offset = term_info.postings_offset as usize;
         let end_source = self.postings_source.len();
         let postings_slice = self.postings_source.slice(offset, end_source);
-        let postings_reader = SourceRead::from(postings_slice);
-        block_postings.reset(term_info.doc_freq as usize, postings_reader);
+        block_postings.reset(term_info.doc_freq, postings_slice);
     }
 
-
+    /// Returns a block postings given a `Term`.
+    /// This method is for an advanced usage only.
+    ///
+    /// Most user should prefer using `read_postings` instead.
+    pub fn read_block_postings(
+        &self,
+        term: &Term,
+        option: IndexRecordOption,
+    ) -> Option<BlockSegmentPostings> {
+        self.get_term_info(term)
+            .map(move |term_info| self.read_block_postings_from_terminfo(&term_info, option))
+    }
 
     /// Returns a block postings given a `term_info`.
     /// This method is for an advanced usage only.
@@ -91,15 +119,15 @@ impl InvertedIndexReader {
     pub fn read_block_postings_from_terminfo(
         &self,
         term_info: &TermInfo,
-        option: IndexRecordOption,
+        requested_option: IndexRecordOption,
     ) -> BlockSegmentPostings {
         let offset = term_info.postings_offset as usize;
         let postings_data = self.postings_source.slice_from(offset);
-        let has_freq = option.has_freq();
         BlockSegmentPostings::from_data(
-            term_info.doc_freq as usize,
-            SourceRead::from(postings_data),
-            has_freq,
+            term_info.doc_freq,
+            postings_data,
+            self.record_option,
+            requested_option,
         )
     }
 
@@ -113,19 +141,24 @@ impl InvertedIndexReader {
         option: IndexRecordOption,
     ) -> SegmentPostings {
         let block_postings = self.read_block_postings_from_terminfo(term_info, option);
-        let delete_bitset = self.delete_bitset.clone();
         let position_stream = {
             if option.has_positions() {
-                let position_offset = term_info.positions_offset;
-                let positions_source = self.positions_source.slice_from(position_offset as usize);
-                let mut stream = CompressedIntStream::wrap(positions_source);
-                stream.skip(term_info.positions_inner_offset as usize);
-                Some(stream)
+                let position_reader = self.positions_source.clone();
+                let skip_reader = self.positions_idx_source.clone();
+                let position_reader =
+                    PositionReader::new(position_reader, skip_reader, term_info.positions_idx);
+                Some(position_reader)
             } else {
                 None
             }
         };
-        SegmentPostings::from_block_postings(block_postings, delete_bitset, position_stream)
+        SegmentPostings::from_block_postings(block_postings, position_stream)
+    }
+
+    /// Returns the total number of tokens recorded for all documents
+    /// (including deleted documents).
+    pub fn total_num_tokens(&self) -> u64 {
+        self.total_num_tokens
     }
 
     /// Returns the segment postings associated with the term, and with the given option,
@@ -139,22 +172,23 @@ impl InvertedIndexReader {
     /// `TextIndexingOptions` that does not index position will return a `SegmentPostings`
     /// with `DocId`s and frequencies.
     pub fn read_postings(&self, term: &Term, option: IndexRecordOption) -> Option<SegmentPostings> {
-        let field = term.field();
-        let field_entry = self.schema.get_field_entry(field);
-        let term_info = get!(self.get_term_info(term));
-        let maximum_option = get!(field_entry.field_type().get_index_record_option());
-        let best_effort_option = cmp::min(maximum_option, option);
-        Some(self.read_postings_from_terminfo(
-            &term_info,
-            best_effort_option,
-        ))
+        self.get_term_info(term)
+            .map(move |term_info| self.read_postings_from_terminfo(&term_info, option))
+    }
+
+    pub(crate) fn read_postings_no_deletes(
+        &self,
+        term: &Term,
+        option: IndexRecordOption,
+    ) -> Option<SegmentPostings> {
+        self.get_term_info(term)
+            .map(|term_info| self.read_postings_from_terminfo(&term_info, option))
     }
 
     /// Returns the number of documents containing the term.
     pub fn doc_freq(&self, term: &Term) -> u32 {
-        match self.get_term_info(term) {
-            Some(term_info) => term_info.doc_freq,
-            None => 0,
-        }
+        self.get_term_info(term)
+            .map(|term_info| term_info.doc_freq)
+            .unwrap_or(0u32)
     }
 }

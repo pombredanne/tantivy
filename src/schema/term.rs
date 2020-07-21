@@ -1,10 +1,11 @@
 use std::fmt;
 
-use common;
-use byteorder::{BigEndian, ByteOrder};
 use super::Field;
+use crate::common;
+use crate::schema::Facet;
+use crate::DateTime;
+use byteorder::{BigEndian, ByteOrder};
 use std::str;
-
 
 /// Size (in bytes) of the buffer of a int field.
 const INT_TERM_LEN: usize = 4 + 8;
@@ -18,18 +19,51 @@ where
     B: AsRef<[u8]>;
 
 impl Term {
-    /// Builds a term given a field, and a u64-value
+    /// Builds a term given a field, and a i64-value
     ///
-    /// Assuming the term has a field id of 1, and a u64 value of 3234,
-    /// the Term will have 8 bytes.
+    /// Assuming the term has a field id of 1, and a i64 value of 3234,
+    /// the Term will have 12 bytes.
     ///
     /// The first four byte are dedicated to storing the field id as a u64.
-    /// The 4 following bytes are encoding the u64 value.
+    /// The 8 following bytes are encoding the u64 value.
     pub fn from_field_i64(field: Field, val: i64) -> Term {
         let val_u64: u64 = common::i64_to_u64(val);
         Term::from_field_u64(field, val_u64)
     }
 
+    /// Builds a term given a field, and a f64-value
+    ///
+    /// Assuming the term has a field id of 1, and a f64 value of 1.5,
+    /// the Term will have 12 bytes.
+    ///
+    /// The first four byte are dedicated to storing the field id as a u64.
+    /// The 8 following bytes are encoding the f64 as a u64 value.
+    pub fn from_field_f64(field: Field, val: f64) -> Term {
+        let val_u64: u64 = common::f64_to_u64(val);
+        Term::from_field_u64(field, val_u64)
+    }
+
+    /// Builds a term given a field, and a DateTime value
+    ///
+    /// Assuming the term has a field id of 1, and a timestamp i64 value of 3234,
+    /// the Term will have 12 bytes.
+    ///
+    /// The first four byte are dedicated to storing the field id as a u64.
+    /// The 8 following bytes are encoding the DateTime as i64 timestamp value.
+    pub fn from_field_date(field: Field, val: &DateTime) -> Term {
+        let val_timestamp = val.timestamp();
+        Term::from_field_i64(field, val_timestamp)
+    }
+
+    /// Creates a `Term` given a facet.
+    pub fn from_facet(field: Field, facet: &Facet) -> Term {
+        let bytes = facet.encoded_str().as_bytes();
+        let buffer = Vec::with_capacity(4 + bytes.len());
+        let mut term = Term(buffer);
+        term.set_field(field);
+        term.set_bytes(bytes);
+        term
+    }
 
     /// Builds a term given a field, and a string value
     ///
@@ -48,10 +82,10 @@ impl Term {
     /// Builds a term given a field, and a u64-value
     ///
     /// Assuming the term has a field id of 1, and a u64 value of 3234,
-    /// the Term will have 8 bytes.
+    /// the Term will have 12 bytes.
     ///
     /// The first four byte are dedicated to storing the field id as a u64.
-    /// The 4 following bytes are encoding the u64 value.
+    /// The 8 following bytes are encoding the u64 value.
     pub fn from_field_u64(field: Field, val: u64) -> Term {
         let mut term = Term(vec![0u8; INT_TERM_LEN]);
         term.set_field(field);
@@ -59,14 +93,11 @@ impl Term {
         term
     }
 
-    /// Creates a new Term with an empty buffer,
-    /// but with a given capacity.
-    ///
-    /// It is declared unsafe, as the term content
-    /// is not initialized, and a call to `.field()`
-    /// would panic.
-    pub(crate) unsafe fn with_capacity(num_bytes: usize) -> Term {
-        Term(Vec::with_capacity(num_bytes))
+    /// Creates a new Term for a given field.
+    pub(crate) fn for_field(field: Field) -> Term {
+        let mut term = Term(Vec::with_capacity(100));
+        term.set_field(field);
+        term
     }
 
     /// Returns the field.
@@ -74,7 +105,7 @@ impl Term {
         if self.0.len() < 4 {
             self.0.resize(4, 0u8);
         }
-        BigEndian::write_u32(&mut self.0[0..4], field.0);
+        BigEndian::write_u32(&mut self.0[0..4], field.field_id());
     }
 
     /// Sets a u64 value in the term.
@@ -93,20 +124,25 @@ impl Term {
         self.set_u64(common::i64_to_u64(val));
     }
 
+    /// Sets a `f64` value in the term.
+    pub fn set_f64(&mut self, val: f64) {
+        self.set_u64(common::f64_to_u64(val));
+    }
+
+    fn set_bytes(&mut self, bytes: &[u8]) {
+        self.0.resize(4, 0u8);
+        self.0.extend(bytes);
+    }
+
+    pub(crate) fn from_field_bytes(field: Field, bytes: &[u8]) -> Term {
+        let mut term = Term::for_field(field);
+        term.set_bytes(bytes);
+        term
+    }
 
     /// Set the texts only, keeping the field untouched.
     pub fn set_text(&mut self, text: &str) {
-        self.0.resize(4, 0u8);
-        self.0.extend(text.as_bytes());
-    }
-
-    /// Builds a term from its byte representation.
-    ///
-    /// If you want to build a field for a given `str`,
-    /// you want to use `from_field_text`.
-    #[cfg(test)]
-    pub(crate) fn from_bytes(data: &[u8]) -> Term {
-        Term(Vec::from(data))
+        self.set_bytes(text.as_bytes());
     }
 }
 
@@ -121,7 +157,7 @@ where
 
     /// Returns the field.
     pub fn field(&self) -> Field {
-        Field(BigEndian::read_u32(&self.0.as_ref()[..4]))
+        Field::from_field_id(BigEndian::read_u32(&self.0.as_ref()[..4]))
     }
 
     /// Returns the `u64` value stored in a term.
@@ -140,6 +176,15 @@ where
     /// if the term is not a `i64` field.
     pub fn get_i64(&self) -> i64 {
         common::u64_to_i64(BigEndian::read_u64(&self.0.as_ref()[4..]))
+    }
+
+    /// Returns the `f64` value stored in a term.
+    ///
+    /// # Panics
+    /// ... or returns an invalid value
+    /// if the term is not a `f64` field.
+    pub fn get_f64(&self) -> f64 {
+        common::u64_to_f64(BigEndian::read_u64(&self.0.as_ref()[4..]))
     }
 
     /// Returns the text associated with the term.
@@ -178,20 +223,24 @@ where
 }
 
 impl fmt::Debug for Term {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Term({:?})", &self.0[..])
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Term(field={},bytes={:?})",
+            self.field().field_id(),
+            self.value_bytes()
+        )
     }
 }
-
 
 #[cfg(test)]
 mod tests {
 
-    use schema::*;
+    use crate::schema::*;
 
     #[test]
     pub fn test_term() {
-        let mut schema_builder = SchemaBuilder::default();
+        let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("text", STRING);
         let title_field = schema_builder.add_text_field("title", STRING);
         let count_field = schema_builder.add_text_field("count", STRING);
@@ -215,6 +264,5 @@ mod tests {
             assert_eq!(term.as_slice()[10], (933u64 / 256u64) as u8);
             assert_eq!(term.as_slice()[11], (983u64 % 256u64) as u8);
         }
-
     }
 }

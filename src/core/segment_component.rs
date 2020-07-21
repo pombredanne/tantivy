@@ -1,3 +1,4 @@
+use std::slice;
 
 /// Enum describing each component of a tantivy segment.
 /// Each component is stored in its own file,
@@ -9,6 +10,8 @@ pub enum SegmentComponent {
     POSTINGS,
     /// Positions of terms in each document.
     POSITIONS,
+    /// Index to seek within the position file
+    POSITIONSSKIP,
     /// Column-oriented random-access storage of fields.
     FASTFIELDS,
     /// Stores the sum  of the length (in terms) of each field for each document.
@@ -27,16 +30,17 @@ pub enum SegmentComponent {
 
 impl SegmentComponent {
     /// Iterates through the components.
-    pub fn iterator() -> impl Iterator<Item = &'static SegmentComponent> {
-        static SEGMENT_COMPONENTS: [SegmentComponent; 7] = [
+    pub fn iterator() -> slice::Iter<'static, SegmentComponent> {
+        static SEGMENT_COMPONENTS: [SegmentComponent; 8] = [
             SegmentComponent::POSTINGS,
             SegmentComponent::POSITIONS,
+            SegmentComponent::POSITIONSSKIP,
             SegmentComponent::FASTFIELDS,
             SegmentComponent::FIELDNORMS,
             SegmentComponent::TERMS,
             SegmentComponent::STORE,
             SegmentComponent::DELETE,
         ];
-        SEGMENT_COMPONENTS.into_iter()
+        SEGMENT_COMPONENTS.iter()
     }
 }

@@ -1,7 +1,12 @@
-use uuid::Uuid;
+use std::cmp::{Ord, Ordering};
 use std::fmt;
-use std::cmp::{Ordering, Ord};
+use uuid::Uuid;
 
+#[cfg(test)]
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::str::FromStr;
 #[cfg(test)]
 use std::sync::atomic;
 
@@ -16,13 +21,11 @@ use std::sync::atomic;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SegmentId(Uuid);
 
+#[cfg(test)]
+static AUTO_INC_COUNTER: Lazy<atomic::AtomicUsize> = Lazy::new(|| atomic::AtomicUsize::default());
 
 #[cfg(test)]
-lazy_static! {
-    static ref AUTO_INC_COUNTER: atomic::AtomicUsize = atomic::AtomicUsize::default();
-    static ref EMPTY_ARR: [u8; 8] = [0u8; 8];
-}
-
+const ZERO_ARRAY: [u8; 8] = [0u8; 8];
 
 // During tests, we generate the segment id in a autoincrement manner
 // for consistency of segment id between run.
@@ -32,7 +35,7 @@ lazy_static! {
 #[cfg(test)]
 fn create_uuid() -> Uuid {
     let new_auto_inc_id = (*AUTO_INC_COUNTER).fetch_add(1, atomic::Ordering::SeqCst);
-    Uuid::from_fields(new_auto_inc_id as u32, 0, 0, &*EMPTY_ARR).unwrap()
+    Uuid::from_fields(new_auto_inc_id as u32, 0, 0, &ZERO_ARRAY).unwrap()
 }
 
 #[cfg(not(test))]
@@ -46,30 +49,64 @@ impl SegmentId {
         SegmentId(create_uuid())
     }
 
-
     /// Returns a shorter identifier of the segment.
     ///
     /// We are using UUID4, so only 6 bits are fixed,
     /// and the rest is random.
     ///
     /// Picking the first 8 chars is ok to identify
-    /// segments in a display message.
+    /// segments in a display message (e.g. a5c4dfcb).
     pub fn short_uuid_string(&self) -> String {
-        (&self.0.simple().to_string()[..8]).to_string()
+        (&self.0.to_simple_ref().to_string()[..8]).to_string()
     }
 
     /// Returns a segment uuid string.
+    ///
+    /// It consists in 32 lowercase hexadecimal chars
+    /// (e.g. a5c4dfcbdfe645089129e308e26d5523)
     pub fn uuid_string(&self) -> String {
-        self.0.simple().to_string()
+        self.0.to_simple_ref().to_string()
+    }
+
+    /// Build a `SegmentId` string from the full uuid string.
+    ///
+    /// E.g. "a5c4dfcbdfe645089129e308e26d5523"
+    pub fn from_uuid_string(uuid_string: &str) -> Result<SegmentId, SegmentIdParseError> {
+        FromStr::from_str(uuid_string)
+    }
+}
+
+/// Error type used when parsing a `SegmentId` from a string fails.
+pub struct SegmentIdParseError(uuid::Error);
+
+impl Error for SegmentIdParseError {}
+
+impl fmt::Debug for SegmentIdParseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for SegmentIdParseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for SegmentId {
+    type Err = SegmentIdParseError;
+
+    fn from_str(uuid_string: &str) -> Result<Self, SegmentIdParseError> {
+        let uuid = Uuid::parse_str(uuid_string).map_err(SegmentIdParseError)?;
+        Ok(SegmentId(uuid))
     }
 }
 
 impl fmt::Debug for SegmentId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Seg({:?})", self.short_uuid_string())
     }
 }
-
 
 impl PartialOrd for SegmentId {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -80,5 +117,20 @@ impl PartialOrd for SegmentId {
 impl Ord for SegmentId {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.as_bytes().cmp(other.0.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SegmentId;
+
+    #[test]
+    fn test_to_uuid_string() {
+        let full_uuid = "a5c4dfcbdfe645089129e308e26d5523";
+        let segment_id = SegmentId::from_uuid_string(full_uuid).unwrap();
+        assert_eq!(segment_id.uuid_string(), full_uuid);
+        assert_eq!(segment_id.short_uuid_string(), "a5c4dfcb");
+        // one extra char
+        assert!(SegmentId::from_uuid_string("a5c4dfcbdfe645089129e308e26d5523b").is_err());
     }
 }

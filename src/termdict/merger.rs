@@ -1,11 +1,11 @@
-use std::collections::BinaryHeap;
-use termdict::TermStreamerImpl;
+use crate::schema::Term;
+use crate::termdict::TermOrdinal;
+use crate::termdict::TermStreamer;
 use std::cmp::Ordering;
-use termdict::TermStreamer;
-use schema::Term;
+use std::collections::BinaryHeap;
 
 pub struct HeapItem<'a> {
-    pub streamer: TermStreamerImpl<'a>,
+    pub streamer: TermStreamer<'a>,
     pub segment_ord: usize,
 }
 
@@ -44,21 +44,28 @@ pub struct TermMerger<'a> {
 impl<'a> TermMerger<'a> {
     /// Stream of merged term dictionary
     ///
-    ///
-    pub fn new(streams: Vec<TermStreamerImpl<'a>>) -> TermMerger<'a> {
+    pub fn new(streams: Vec<TermStreamer<'a>>) -> TermMerger<'a> {
         TermMerger {
             heap: BinaryHeap::new(),
             current_streamers: streams
                 .into_iter()
                 .enumerate()
-                .map(|(ord, streamer)| {
-                    HeapItem {
-                        streamer: streamer,
-                        segment_ord: ord,
-                    }
+                .map(|(ord, streamer)| HeapItem {
+                    streamer,
+                    segment_ord: ord,
                 })
                 .collect(),
         }
+    }
+
+    pub(crate) fn matching_segments<'b: 'a>(
+        &'b self,
+    ) -> Box<dyn 'b + Iterator<Item = (usize, TermOrdinal)>> {
+        Box::new(
+            self.current_streamers
+                .iter()
+                .map(|heap_item| (heap_item.segment_ord, heap_item.streamer.term_ord())),
+        )
     }
 
     fn advance_segments(&mut self) {
@@ -71,23 +78,17 @@ impl<'a> TermMerger<'a> {
         }
     }
 
-
     /// Advance the term iterator to the next term.
     /// Returns true if there is indeed another term
     /// False if there is none.
-    #[allow(while_let_loop)]
     pub fn advance(&mut self) -> bool {
         self.advance_segments();
         if let Some(head) = self.heap.pop() {
             self.current_streamers.push(head);
-            loop {
-                if let Some(next_streamer) = self.heap.peek() {
-                    if self.current_streamers[0].streamer.key() != next_streamer.streamer.key() {
-                        break;
-                    }
-                } else {
+            while let Some(next_streamer) = self.heap.peek() {
+                if self.current_streamers[0].streamer.key() != next_streamer.streamer.key() {
                     break;
-                } // no more streamer.
+                }
                 let next_heap_it = self.heap.pop().unwrap(); // safe : we peeked beforehand
                 self.current_streamers.push(next_heap_it);
             }
@@ -117,7 +118,7 @@ impl<'a> TermMerger<'a> {
     }
 
     /// Iterates through terms
-    #[allow(should_implement_trait)]
+    #[cfg_attr(feature = "cargo-clippy", allow(clippy::should_implement_trait))]
     pub fn next(&mut self) -> Option<Term<&[u8]>> {
         if self.advance() {
             Some(Term::wrap(self.current_streamers[0].streamer.key()))

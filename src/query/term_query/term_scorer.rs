@@ -1,60 +1,71 @@
-use Score;
-use DocId;
-use fastfield::U64FastFieldReader;
-use postings::DocSet;
-use query::Scorer;
-use postings::Postings;
-use fastfield::FastFieldReader;
+use crate::docset::DocSet;
+use crate::query::{Explanation, Scorer};
+use crate::DocId;
+use crate::Score;
 
-pub struct TermScorer<TPostings>
-where
-    TPostings: Postings,
-{
-    pub idf: Score,
-    pub fieldnorm_reader_opt: Option<U64FastFieldReader>,
-    pub postings: TPostings,
+use crate::fieldnorm::FieldNormReader;
+use crate::postings::Postings;
+use crate::postings::SegmentPostings;
+use crate::query::bm25::BM25Weight;
+
+pub struct TermScorer {
+    postings: SegmentPostings,
+    fieldnorm_reader: FieldNormReader,
+    similarity_weight: BM25Weight,
 }
 
-impl<TPostings> TermScorer<TPostings>
-where
-    TPostings: Postings,
-{
-    pub fn postings(&self) -> &TPostings {
-        &self.postings
+impl TermScorer {
+    pub fn new(
+        postings: SegmentPostings,
+        fieldnorm_reader: FieldNormReader,
+        similarity_weight: BM25Weight,
+    ) -> TermScorer {
+        TermScorer {
+            postings,
+            fieldnorm_reader,
+            similarity_weight,
+        }
     }
 }
 
-impl<TPostings> DocSet for TermScorer<TPostings>
-where
-    TPostings: Postings,
-{
-    fn advance(&mut self) -> bool {
+impl TermScorer {
+    pub fn term_freq(&self) -> u32 {
+        self.postings.term_freq()
+    }
+
+    pub fn fieldnorm_id(&self) -> u8 {
+        self.fieldnorm_reader.fieldnorm_id(self.doc())
+    }
+
+    pub fn explain(&self) -> Explanation {
+        let fieldnorm_id = self.fieldnorm_id();
+        let term_freq = self.term_freq();
+        self.similarity_weight.explain(fieldnorm_id, term_freq)
+    }
+}
+
+impl DocSet for TermScorer {
+    fn advance(&mut self) -> DocId {
         self.postings.advance()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.postings.seek(target)
     }
 
     fn doc(&self) -> DocId {
         self.postings.doc()
     }
 
-
-    fn size_hint(&self) -> usize {
+    fn size_hint(&self) -> u32 {
         self.postings.size_hint()
     }
 }
 
-impl<TPostings> Scorer for TermScorer<TPostings>
-where
-    TPostings: Postings,
-{
-    fn score(&self) -> Score {
-        let doc = self.postings.doc();
-        let tf = match self.fieldnorm_reader_opt {
-            Some(ref fieldnorm_reader) => {
-                let field_norm = fieldnorm_reader.get(doc);
-                (self.postings.term_freq() as f32 / field_norm as f32)
-            }
-            None => self.postings.term_freq() as f32,
-        };
-        self.idf * tf.sqrt()
+impl Scorer for TermScorer {
+    fn score(&mut self) -> Score {
+        let fieldnorm_id = self.fieldnorm_id();
+        let term_freq = self.term_freq();
+        self.similarity_weight.score(fieldnorm_id, term_freq)
     }
 }

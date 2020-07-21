@@ -1,51 +1,71 @@
-use atomicwrites;
-use common::make_io_err;
-use directory::Directory;
-use directory::error::{IOError, OpenWriteError, OpenReadError, DeleteError, OpenDirectoryError};
-use directory::ReadOnlySource;
-use directory::shared_vec_slice::SharedVecSlice;
-use directory::WritePtr;
-use fst::raw::MmapReadOnly;
-use memmap::{Mmap, Protection};
-use std::collections::hash_map::Entry as HashMapEntry;
+use crate::core::META_FILEPATH;
+use crate::directory::error::LockError;
+use crate::directory::error::{
+    DeleteError, IOError, OpenDirectoryError, OpenReadError, OpenWriteError,
+};
+use crate::directory::read_only_source::BoxedData;
+use crate::directory::AntiCallToken;
+use crate::directory::Directory;
+use crate::directory::DirectoryLock;
+use crate::directory::Lock;
+use crate::directory::ReadOnlySource;
+use crate::directory::WatchCallback;
+use crate::directory::WatchCallbackList;
+use crate::directory::WatchHandle;
+use crate::directory::{TerminatingWrite, WritePtr};
+use fs2::FileExt;
+use memmap::Mmap;
+use notify::RawEvent;
+use notify::RecursiveMode;
+use notify::Watcher;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::From;
 use std::fmt;
-use std::fs::{self, File};
 use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Seek, SeekFrom};
 use std::io::{BufWriter, Read, Write};
-use std::mem;
 use std::path::{Path, PathBuf};
 use std::result;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::Weak;
-use tempdir::TempDir;
+use std::thread;
+use tempfile::TempDir;
 
-fn open_mmap(full_path: &Path) -> result::Result<Option<Arc<Mmap>>, OpenReadError> {
-    let file = File::open(&full_path).map_err(|e| if e.kind() ==
-        io::ErrorKind::NotFound
-    {
-        OpenReadError::FileDoesNotExist(full_path.to_owned())
-    } else {
-        OpenReadError::IOError(IOError::with_path(full_path.to_owned(), e))
+/// Create a default io error given a string.
+pub(crate) fn make_io_err(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, msg)
+}
+
+/// Returns None iff the file exists, can be read, but is empty (and hence
+/// cannot be mmapped)
+fn open_mmap(full_path: &Path) -> result::Result<Option<Mmap>, OpenReadError> {
+    let file = File::open(full_path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            OpenReadError::FileDoesNotExist(full_path.to_owned())
+        } else {
+            OpenReadError::IOError(IOError::with_path(full_path.to_owned(), e))
+        }
     })?;
 
-    let meta_data = file.metadata().map_err(|e| {
-        IOError::with_path(full_path.to_owned(), e)
-    })?;
+    let meta_data = file
+        .metadata()
+        .map_err(|e| IOError::with_path(full_path.to_owned(), e))?;
     if meta_data.len() == 0 {
         // if the file size is 0, it will not be possible
-        // to mmap the file, so we return an anonymous mmap_cache
+        // to mmap the file, so we return None
         // instead.
         return Ok(None);
     }
-    match Mmap::open(&file, Protection::Read) {
-        Ok(mmap) => Ok(Some(Arc::new(mmap))),
-        Err(e) => Err(IOError::with_path(full_path.to_owned(), e))?,
+    unsafe {
+        memmap::Mmap::map(&file)
+            .map(Some)
+            .map_err(|e| From::from(IOError::with_path(full_path.to_owned(), e)))
     }
-
 }
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
@@ -54,10 +74,7 @@ pub struct CacheCounters {
     pub hit: usize,
     // Number of time tantivy had to call `mmap`
     // as no entry was in the cache.
-    pub miss_empty: usize,
-    // Number of time tantivy had to call `mmap`
-    // as the entry in the cache was evinced.
-    pub miss_weak: usize,
+    pub miss: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,39 +85,20 @@ pub struct CacheInfo {
 
 struct MmapCache {
     counters: CacheCounters,
-    cache: HashMap<PathBuf, Weak<Mmap>>,
-    purge_weak_limit: usize,
+    cache: HashMap<PathBuf, Weak<BoxedData>>,
 }
-
-const STARTING_PURGE_WEAK_LIMIT: usize = 1_000;
 
 impl Default for MmapCache {
     fn default() -> MmapCache {
         MmapCache {
             counters: CacheCounters::default(),
             cache: HashMap::new(),
-            purge_weak_limit: STARTING_PURGE_WEAK_LIMIT,
         }
     }
 }
 
-
 impl MmapCache {
-    fn cleanup(&mut self) {
-        let previous_cache_size = self.cache.len();
-        let mut new_cache = HashMap::new();
-        mem::swap(&mut new_cache, &mut self.cache);
-        self.cache = new_cache
-            .into_iter()
-            .filter(|&(_, ref weak_ref)| weak_ref.upgrade().is_some())
-            .collect();
-        if self.cache.len() == previous_cache_size {
-            self.purge_weak_limit *= 2;
-        }
-    }
-
-    fn get_info(&mut self) -> CacheInfo {
-        self.cleanup();
+    fn get_info(&self) -> CacheInfo {
         let paths: Vec<PathBuf> = self.cache.keys().cloned().collect();
         CacheInfo {
             counters: self.counters.clone(),
@@ -108,38 +106,92 @@ impl MmapCache {
         }
     }
 
-    fn get_mmap(&mut self, full_path: PathBuf) -> Result<Option<Arc<Mmap>>, OpenReadError> {
-        // if we exceed this limit, then we go through the weak
-        // and remove those that are obsolete.
-        if self.cache.len() > self.purge_weak_limit {
-            self.cleanup();
+    fn remove_weak_ref(&mut self) {
+        let keys_to_remove: Vec<PathBuf> = self
+            .cache
+            .iter()
+            .filter(|(_, mmap_weakref)| mmap_weakref.upgrade().is_none())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys_to_remove {
+            self.cache.remove(&key);
         }
-        Ok(match self.cache.entry(full_path.clone()) {
-            HashMapEntry::Occupied(mut occupied_entry) => {
-                if let Some(mmap_arc) = occupied_entry.get().upgrade() {
-                    self.counters.hit += 1;
-                    Some(mmap_arc.clone())
-                } else {
-                    // The entry exists but the weak ref has been destroyed.
-                    self.counters.miss_weak += 1;
-                    if let Some(mmap_arc) = open_mmap(&full_path)? {
-                        occupied_entry.insert(Arc::downgrade(&mmap_arc));
-                        Some(mmap_arc)
-                    } else {
-                        None
+    }
+
+    // Returns None if the file exists but as a len of 0 (and hence is not mmappable).
+    fn get_mmap(&mut self, full_path: &Path) -> Result<Option<Arc<BoxedData>>, OpenReadError> {
+        if let Some(mmap_weak) = self.cache.get(full_path) {
+            if let Some(mmap_arc) = mmap_weak.upgrade() {
+                self.counters.hit += 1;
+                return Ok(Some(mmap_arc));
+            }
+        }
+        self.cache.remove(full_path);
+        self.counters.miss += 1;
+        let mmap_opt = open_mmap(full_path)?;
+        Ok(mmap_opt.map(|mmap| {
+            let mmap_arc: Arc<BoxedData> = Arc::new(Box::new(mmap));
+            let mmap_weak = Arc::downgrade(&mmap_arc);
+            self.cache.insert(full_path.to_owned(), mmap_weak);
+            mmap_arc
+        }))
+    }
+}
+
+struct WatcherWrapper {
+    _watcher: Mutex<notify::RecommendedWatcher>,
+    watcher_router: Arc<WatchCallbackList>,
+}
+
+impl WatcherWrapper {
+    pub fn new(path: &Path) -> Result<Self, OpenDirectoryError> {
+        let (tx, watcher_recv): (Sender<RawEvent>, Receiver<RawEvent>) = channel();
+        // We need to initialize the
+        let watcher = notify::raw_watcher(tx)
+            .and_then(|mut watcher| {
+                watcher.watch(path, RecursiveMode::Recursive)?;
+                Ok(watcher)
+            })
+            .map_err(|err| match err {
+                notify::Error::PathNotFound => OpenDirectoryError::DoesNotExist(path.to_owned()),
+                _ => {
+                    panic!("Unknown error while starting watching directory {:?}", path);
+                }
+            })?;
+        let watcher_router: Arc<WatchCallbackList> = Default::default();
+        let watcher_router_clone = watcher_router.clone();
+        thread::Builder::new()
+            .name("meta-file-watch-thread".to_string())
+            .spawn(move || {
+                loop {
+                    match watcher_recv.recv().map(|evt| evt.path) {
+                        Ok(Some(changed_path)) => {
+                            // ... Actually subject to false positive.
+                            // We might want to be more accurate than this at one point.
+                            if let Some(filename) = changed_path.file_name() {
+                                if filename == *META_FILEPATH {
+                                    let _ = watcher_router_clone.broadcast();
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // not an event we are interested in.
+                        }
+                        Err(_e) => {
+                            // the watch send channel was dropped
+                            break;
+                        }
                     }
                 }
-            }
-            HashMapEntry::Vacant(vacant_entry) => {
-                self.counters.miss_empty += 1;
-                if let Some(mmap_arc) = open_mmap(&full_path)? {
-                    vacant_entry.insert(Arc::downgrade(&mmap_arc));
-                    Some(mmap_arc)
-                } else {
-                    None
-                }
-            }
+            })?;
+        Ok(WatcherWrapper {
+            _watcher: Mutex::new(watcher),
+            watcher_router,
         })
+    }
+
+    pub fn watch(&mut self, watch_callback: WatchCallback) -> WatchHandle {
+        self.watcher_router.subscribe(watch_callback)
     }
 }
 
@@ -147,33 +199,82 @@ impl MmapCache {
 ///
 /// The Mmap object are cached to limit the
 /// system calls.
+///
+/// In the `MmapDirectory`, locks are implemented using the `fs2` crate definition of locks.
+///
+/// On MacOS & linux, it relies on `flock` (aka `BSD Lock`). These locks solve most of the
+/// problems related to POSIX Locks, but may their contract may not be respected on `NFS`
+/// depending on the implementation.
+///
+/// On Windows the semantics are again different.
 #[derive(Clone)]
 pub struct MmapDirectory {
+    inner: Arc<MmapDirectoryInner>,
+}
+
+struct MmapDirectoryInner {
     root_path: PathBuf,
-    mmap_cache: Arc<RwLock<MmapCache>>,
-    _temp_directory: Arc<Option<TempDir>>,
+    mmap_cache: RwLock<MmapCache>,
+    _temp_directory: Option<TempDir>,
+    watcher: RwLock<Option<WatcherWrapper>>,
+}
+
+impl MmapDirectoryInner {
+    fn new(root_path: PathBuf, temp_directory: Option<TempDir>) -> MmapDirectoryInner {
+        MmapDirectoryInner {
+            root_path,
+            mmap_cache: Default::default(),
+            _temp_directory: temp_directory,
+            watcher: RwLock::new(None),
+        }
+    }
+
+    fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle> {
+        // a lot of juggling here, to ensure we don't do anything that panics
+        // while the rwlock is held. That way we ensure that the rwlock cannot
+        // be poisoned.
+        //
+        // The downside is that we might create a watch wrapper that is not useful.
+        let need_initialization = self.watcher.read().unwrap().is_none();
+        if need_initialization {
+            let watch_wrapper = WatcherWrapper::new(&self.root_path)?;
+            let mut watch_wlock = self.watcher.write().unwrap();
+            // the watcher could have been initialized when we released the lock, and
+            // we do not want to lose the watched files that were set.
+            if watch_wlock.is_none() {
+                *watch_wlock = Some(watch_wrapper);
+            }
+        }
+        if let Some(watch_wrapper) = self.watcher.write().unwrap().as_mut() {
+            Ok(watch_wrapper.watch(watch_callback))
+        } else {
+            unreachable!("At this point, watch wrapper is supposed to be initialized");
+        }
+    }
 }
 
 impl fmt::Debug for MmapDirectory {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "MmapDirectory({:?})", self.root_path)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MmapDirectory({:?})", self.inner.root_path)
     }
 }
 
 impl MmapDirectory {
+    fn new(root_path: PathBuf, temp_directory: Option<TempDir>) -> MmapDirectory {
+        let inner = MmapDirectoryInner::new(root_path, temp_directory);
+        MmapDirectory {
+            inner: Arc::new(inner),
+        }
+    }
+
     /// Creates a new MmapDirectory in a temporary directory.
     ///
     /// This is mostly useful to test the MmapDirectory itself.
     /// For your unit tests, prefer the RAMDirectory.
-    pub fn create_from_tempdir() -> io::Result<MmapDirectory> {
-        let tempdir = try!(TempDir::new("index"));
+    pub fn create_from_tempdir() -> Result<MmapDirectory, OpenDirectoryError> {
+        let tempdir = TempDir::new().map_err(OpenDirectoryError::IoError)?;
         let tempdir_path = PathBuf::from(tempdir.path());
-        let directory = MmapDirectory {
-            root_path: PathBuf::from(tempdir_path),
-            mmap_cache: Arc::new(RwLock::new(MmapCache::default())),
-            _temp_directory: Arc::new(Some(tempdir)),
-        };
-        Ok(directory)
+        Ok(MmapDirectory::new(tempdir_path, Some(tempdir)))
     }
 
     /// Opens a MmapDirectory in a directory.
@@ -183,26 +284,22 @@ impl MmapDirectory {
     pub fn open<P: AsRef<Path>>(directory_path: P) -> Result<MmapDirectory, OpenDirectoryError> {
         let directory_path: &Path = directory_path.as_ref();
         if !directory_path.exists() {
-            Err(OpenDirectoryError::DoesNotExist(
-                PathBuf::from(directory_path),
-            ))
+            Err(OpenDirectoryError::DoesNotExist(PathBuf::from(
+                directory_path,
+            )))
         } else if !directory_path.is_dir() {
-            Err(OpenDirectoryError::NotADirectory(
-                PathBuf::from(directory_path),
-            ))
+            Err(OpenDirectoryError::NotADirectory(PathBuf::from(
+                directory_path,
+            )))
         } else {
-            Ok(MmapDirectory {
-                root_path: PathBuf::from(directory_path),
-                mmap_cache: Arc::new(RwLock::new(MmapCache::default())),
-                _temp_directory: Arc::new(None),
-            })
+            Ok(MmapDirectory::new(PathBuf::from(directory_path), None))
         }
     }
 
     /// Joins a relative_path to the directory `root_path`
     /// to create a proper complete `filepath`.
     fn resolve_path(&self, relative_path: &Path) -> PathBuf {
-        self.root_path.join(relative_path)
+        self.inner.root_path.join(relative_path)
     }
 
     /// Sync the root directory.
@@ -220,27 +317,49 @@ impl MmapDirectory {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            use winapi::winbase;
+            use winapi::um::winbase;
 
-            open_opts.write(true).custom_flags(
-                winbase::FILE_FLAG_BACKUP_SEMANTICS,
-            );
+            open_opts
+                .write(true)
+                .custom_flags(winbase::FILE_FLAG_BACKUP_SEMANTICS);
         }
 
-        let fd = try!(open_opts.open(&self.root_path));
-        try!(fd.sync_all());
+        let fd = open_opts.open(&self.inner.root_path)?;
+        fd.sync_all()?;
         Ok(())
     }
+
     /// Returns some statistical information
     /// about the Mmap cache.
     ///
     /// The `MmapDirectory` embeds a `MmapDirectory`
     /// to avoid multiplying the `mmap` system calls.
-    pub fn get_cache_info(&mut self) -> CacheInfo {
-        self.mmap_cache
+    pub fn get_cache_info(&self) -> CacheInfo {
+        self.inner
+            .mmap_cache
             .write()
+            .expect("mmap cache lock is poisoned")
+            .remove_weak_ref();
+        self.inner
+            .mmap_cache
+            .read()
             .expect("Mmap cache lock is poisoned.")
             .get_info()
+    }
+}
+
+/// We rely on fs2 for file locking. On Windows & MacOS this
+/// uses BSD locks (`flock`). The lock is actually released when
+/// the `File` object is dropped and its associated file descriptor
+/// is closed.
+struct ReleaseLockFile {
+    _file: File,
+    path: PathBuf,
+}
+
+impl Drop for ReleaseLockFile {
+    fn drop(&mut self) {
+        debug!("Releasing lock {:?}", self.path);
     }
 }
 
@@ -260,7 +379,7 @@ impl Write for SafeFileWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        try!(self.0.flush());
+        self.0.flush()?;
         self.0.sync_all()
     }
 }
@@ -271,82 +390,39 @@ impl Seek for SafeFileWriter {
     }
 }
 
+impl TerminatingWrite for SafeFileWriter {
+    fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()> {
+        self.flush()
+    }
+}
 
 impl Directory for MmapDirectory {
     fn open_read(&self, path: &Path) -> result::Result<ReadOnlySource, OpenReadError> {
         debug!("Open Read {:?}", path);
         let full_path = self.resolve_path(path);
 
-        let mut mmap_cache = self.mmap_cache.write().map_err(|_| {
+        let mut mmap_cache = self.inner.mmap_cache.write().map_err(|_| {
             let msg = format!(
                 "Failed to acquired write lock \
-                                            on mmap cache while reading {:?}",
+                 on mmap cache while reading {:?}",
                 path
             );
             IOError::with_path(path.to_owned(), make_io_err(msg))
         })?;
-
-        Ok(
-            mmap_cache
-                .get_mmap(full_path)?
-                .map(MmapReadOnly::from)
-                .map(ReadOnlySource::Mmap)
-                .unwrap_or_else(|| ReadOnlySource::Anonymous(SharedVecSlice::empty())),
-        )
+        Ok(mmap_cache
+            .get_mmap(&full_path)?
+            .map(ReadOnlySource::from)
+            .unwrap_or_else(ReadOnlySource::empty))
     }
 
-    fn open_write(&mut self, path: &Path) -> Result<WritePtr, OpenWriteError> {
-        debug!("Open Write {:?}", path);
-        let full_path = self.resolve_path(path);
-
-        let open_res = OpenOptions::new().write(true).create_new(true).open(
-            full_path,
-        );
-
-        let mut file = open_res.map_err(|err| if err.kind() ==
-            io::ErrorKind::AlreadyExists
-        {
-            OpenWriteError::FileAlreadyExists(path.to_owned())
-        } else {
-            IOError::with_path(path.to_owned(), err).into()
-        })?;
-
-        // making sure the file is created.
-        file.flush().map_err(
-            |e| IOError::with_path(path.to_owned(), e),
-        )?;
-
-        // Apparetntly, on some filesystem syncing the parent
-        // directory is required.
-        self.sync_directory().map_err(|e| {
-            IOError::with_path(path.to_owned(), e)
-        })?;
-
-        let writer = SafeFileWriter::new(file);
-        Ok(BufWriter::new(Box::new(writer)))
-    }
-
+    /// Any entry associated to the path in the mmap will be
+    /// removed before the file is deleted.
     fn delete(&self, path: &Path) -> result::Result<(), DeleteError> {
-        debug!("Deleting file {:?}", path);
         let full_path = self.resolve_path(path);
-        let mut mmap_cache = self.mmap_cache.write().map_err(|_| {
-            let msg = format!(
-                "Failed to acquired write lock \
-                                            on mmap cache while deleting {:?}",
-                path
-            );
-            IOError::with_path(path.to_owned(), make_io_err(msg))
-        })?;
-        // Removing the entry in the MMap cache.
-        // The munmap will appear on Drop,
-        // when the last reference is gone.
-        mmap_cache.cache.remove(&full_path);
         match fs::remove_file(&full_path) {
-            Ok(_) => {
-                self.sync_directory().map_err(|e| {
-                    IOError::with_path(path.to_owned(), e).into()
-                })
-            }
+            Ok(_) => self
+                .sync_directory()
+                .map_err(|e| IOError::with_path(path.to_owned(), e).into()),
             Err(e) => {
                 if e.kind() == io::ErrorKind::NotFound {
                     Err(DeleteError::FileDoesNotExist(path.to_owned()))
@@ -362,14 +438,43 @@ impl Directory for MmapDirectory {
         full_path.exists()
     }
 
+    fn open_write(&mut self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        debug!("Open Write {:?}", path);
+        let full_path = self.resolve_path(path);
+
+        let open_res = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(full_path);
+
+        let mut file = open_res.map_err(|err| {
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                OpenWriteError::FileAlreadyExists(path.to_owned())
+            } else {
+                IOError::with_path(path.to_owned(), err).into()
+            }
+        })?;
+
+        // making sure the file is created.
+        file.flush()
+            .map_err(|e| IOError::with_path(path.to_owned(), e))?;
+
+        // Apparetntly, on some filesystem syncing the parent
+        // directory is required.
+        self.sync_directory()
+            .map_err(|e| IOError::with_path(path.to_owned(), e))?;
+
+        let writer = SafeFileWriter::new(file);
+        Ok(BufWriter::new(Box::new(writer)))
+    }
+
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let full_path = self.resolve_path(path);
         let mut buffer = Vec::new();
         match File::open(&full_path) {
             Ok(mut file) => {
-                file.read_to_end(&mut buffer).map_err(|e| {
-                    IOError::with_path(path.to_owned(), e)
-                })?;
+                file.read_to_end(&mut buffer)
+                    .map_err(|e| IOError::with_path(path.to_owned(), e))?;
                 Ok(buffer)
             }
             Err(e) => {
@@ -380,24 +485,40 @@ impl Directory for MmapDirectory {
                 }
             }
         }
-
     }
 
     fn atomic_write(&mut self, path: &Path, data: &[u8]) -> io::Result<()> {
         debug!("Atomic Write {:?}", path);
         let full_path = self.resolve_path(path);
         let meta_file = atomicwrites::AtomicFile::new(full_path, atomicwrites::AllowOverwrite);
-        try!(meta_file.write(|f| f.write_all(data)));
+        meta_file.write(|f| f.write_all(data))?;
         Ok(())
     }
 
-    fn box_clone(&self) -> Box<Directory> {
-        Box::new(self.clone())
+    fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
+        let full_path = self.resolve_path(&lock.filepath);
+        // We make sure that the file exists.
+        let file: File = OpenOptions::new()
+            .write(true)
+            .create(true) //< if the file does not exist yet, create it.
+            .open(&full_path)
+            .map_err(LockError::IOError)?;
+        if lock.is_blocking {
+            file.lock_exclusive().map_err(LockError::IOError)?;
+        } else {
+            file.try_lock_exclusive().map_err(|_| LockError::LockBusy)?
+        }
+        // dropping the file handle will release the lock.
+        Ok(DirectoryLock::from(Box::new(ReleaseLockFile {
+            path: lock.filepath.clone(),
+            _file: file,
+        })))
+    }
+
+    fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle> {
+        self.inner.watch(watch_callback)
     }
 }
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -406,6 +527,17 @@ mod tests {
     // The following tests are specific to the MmapDirectory
 
     use super::*;
+    use crate::indexer::LogMergePolicy;
+    use crate::schema::{Schema, SchemaBuilder, TEXT};
+    use crate::Index;
+    use crate::ReloadPolicy;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_open_non_existent_path() {
+        assert!(MmapDirectory::open(PathBuf::from("./nowhere")).is_err());
+    }
 
     #[test]
     fn test_open_empty() {
@@ -425,12 +557,13 @@ mod tests {
 
     #[test]
     fn test_cache() {
-        let content = "abc".as_bytes();
+        let content = b"abc";
 
         // here we test if the cache releases
         // mmaps correctly.
         let mut mmap_directory = MmapDirectory::create_from_tempdir().unwrap();
-        let paths: Vec<PathBuf> = (0..10)
+        let num_paths = 10;
+        let paths: Vec<PathBuf> = (0..num_paths)
             .map(|i| PathBuf::from(&*format!("file_{}", i)))
             .collect();
         {
@@ -440,53 +573,117 @@ mod tests {
                 w.flush().unwrap();
             }
         }
-        {
-            for path in &paths {
-                {
-                    let _r = mmap_directory.open_read(path).unwrap();
-                    assert_eq!(mmap_directory.get_cache_info().mmapped.len(), 1);
-                }
-                assert_eq!(mmap_directory.get_cache_info().mmapped.len(), 0);
-            }
+
+        let mut keep = vec![];
+        for (i, path) in paths.iter().enumerate() {
+            keep.push(mmap_directory.open_read(path).unwrap());
+            assert_eq!(mmap_directory.get_cache_info().mmapped.len(), i + 1);
         }
-        assert_eq!(mmap_directory.get_cache_info().counters.miss_empty, 10);
+        assert_eq!(mmap_directory.get_cache_info().counters.hit, 0);
+        assert_eq!(mmap_directory.get_cache_info().counters.miss, 10);
+        assert_eq!(mmap_directory.get_cache_info().mmapped.len(), 10);
+        for path in paths.iter() {
+            let _r = mmap_directory.open_read(path).unwrap();
+            assert_eq!(mmap_directory.get_cache_info().mmapped.len(), num_paths);
+        }
+        assert_eq!(mmap_directory.get_cache_info().counters.hit, 10);
+        assert_eq!(mmap_directory.get_cache_info().counters.miss, 10);
+        assert_eq!(mmap_directory.get_cache_info().mmapped.len(), 10);
 
-
-        {
-            // test weak miss
-            // the first pass create the weak refs.
-            for path in &paths {
-                let _r = mmap_directory.open_read(path).unwrap();
-            }
-            // ... the second hits the weak refs.
-            for path in &paths {
-                let _r = mmap_directory.open_read(path).unwrap();
-            }
-            let cache_info = mmap_directory.get_cache_info();
-            assert_eq!(cache_info.counters.miss_empty, 20);
-            assert_eq!(cache_info.counters.miss_weak, 10);
+        for path in paths.iter() {
+            let _r = mmap_directory.open_read(path).unwrap();
+            assert_eq!(mmap_directory.get_cache_info().mmapped.len(), 10);
         }
 
-        {
-            let mut saved_readmmaps = vec![];
-            // Keeps reference alive
-            for (i, path) in paths.iter().enumerate() {
-                let r = mmap_directory.open_read(path).unwrap();
-                saved_readmmaps.push(r);
-                assert_eq!(mmap_directory.get_cache_info().mmapped.len(), i + 1);
-            }
-            let cache_info = mmap_directory.get_cache_info();
-            assert_eq!(cache_info.counters.miss_empty, 30);
-            assert_eq!(cache_info.counters.miss_weak, 10);
-            assert_eq!(cache_info.mmapped.len(), 10);
-
-            for saved_readmmap in saved_readmmaps {
-                assert_eq!(saved_readmmap.as_slice(), content);
-            }
+        assert_eq!(mmap_directory.get_cache_info().counters.hit, 20);
+        assert_eq!(mmap_directory.get_cache_info().counters.miss, 10);
+        assert_eq!(mmap_directory.get_cache_info().mmapped.len(), 10);
+        drop(keep);
+        for path in paths.iter() {
+            let _r = mmap_directory.open_read(path).unwrap();
+            assert_eq!(mmap_directory.get_cache_info().mmapped.len(), 1);
         }
-
+        assert_eq!(mmap_directory.get_cache_info().counters.hit, 20);
+        assert_eq!(mmap_directory.get_cache_info().counters.miss, 20);
         assert_eq!(mmap_directory.get_cache_info().mmapped.len(), 0);
 
+        for path in &paths {
+            mmap_directory.delete(path).unwrap();
+        }
+        assert_eq!(mmap_directory.get_cache_info().counters.hit, 20);
+        assert_eq!(mmap_directory.get_cache_info().counters.miss, 20);
+        assert_eq!(mmap_directory.get_cache_info().mmapped.len(), 0);
+        for path in paths.iter() {
+            assert!(mmap_directory.open_read(path).is_err());
+        }
+        assert_eq!(mmap_directory.get_cache_info().counters.hit, 20);
+        assert_eq!(mmap_directory.get_cache_info().counters.miss, 30);
+        assert_eq!(mmap_directory.get_cache_info().mmapped.len(), 0);
     }
 
+    #[test]
+    fn test_watch_wrapper() {
+        let counter: Arc<AtomicUsize> = Default::default();
+        let counter_clone = counter.clone();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp_dirpath = tmp_dir.path().to_owned();
+        let mut watch_wrapper = WatcherWrapper::new(&tmp_dirpath).unwrap();
+        let tmp_file = tmp_dirpath.join(*META_FILEPATH);
+        let _handle = watch_wrapper.watch(Box::new(move || {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+        let (sender, receiver) = crossbeam::channel::unbounded();
+        let _handle2 = watch_wrapper.watch(Box::new(move || {
+            let _ = sender.send(());
+        }));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        fs::write(&tmp_file, b"whateverwilldo").unwrap();
+        assert!(receiver.recv().is_ok());
+        assert!(counter.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn test_mmap_released() {
+        let mmap_directory = MmapDirectory::create_from_tempdir().unwrap();
+        let mut schema_builder: SchemaBuilder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+
+        {
+            let index = Index::create(mmap_directory.clone(), schema).unwrap();
+
+            let mut index_writer = index.writer_with_num_threads(1, 3_000_000).unwrap();
+            let mut log_merge_policy = LogMergePolicy::default();
+            log_merge_policy.set_min_merge_size(3);
+            index_writer.set_merge_policy(Box::new(log_merge_policy));
+            for _num_commits in 0..10 {
+                for _ in 0..10 {
+                    index_writer.add_document(doc!(text_field=>"abc"));
+                }
+                index_writer.commit().unwrap();
+            }
+
+            let reader = index
+                .reader_builder()
+                .reload_policy(ReloadPolicy::Manual)
+                .try_into()
+                .unwrap();
+
+            for _ in 0..4 {
+                index_writer.add_document(doc!(text_field=>"abc"));
+                index_writer.commit().unwrap();
+                reader.reload().unwrap();
+            }
+            index_writer.wait_merging_threads().unwrap();
+
+            reader.reload().unwrap();
+            let num_segments = reader.searcher().segment_readers().len();
+            assert!(num_segments <= 4);
+            assert_eq!(
+                num_segments * 7,
+                mmap_directory.get_cache_info().mmapped.len()
+            );
+        }
+        assert!(mmap_directory.get_cache_info().mmapped.is_empty());
+    }
 }

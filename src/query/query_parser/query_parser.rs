@@ -1,47 +1,110 @@
-use schema::{Schema, Field};
-use query::Query;
-use query::BooleanQuery;
 use super::logical_ast::*;
-use super::user_input_ast::*;
-use super::query_grammar::parse_to_ast;
-use query::Occur;
-use query::TermQuery;
-use schema::IndexRecordOption;
-use query::PhraseQuery;
-use schema::{Term, FieldType};
+use crate::core::Index;
+use crate::query::BooleanQuery;
+use crate::query::EmptyQuery;
+use crate::query::Occur;
+use crate::query::PhraseQuery;
+use crate::query::Query;
+use crate::query::RangeQuery;
+use crate::query::TermQuery;
+use crate::query::{AllQuery, BoostQuery};
+use crate::schema::{Facet, IndexRecordOption};
+use crate::schema::{Field, Schema};
+use crate::schema::{FieldType, Term};
+use crate::tokenizer::TokenizerManager;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::num::{ParseFloatError, ParseIntError};
+use std::ops::Bound;
 use std::str::FromStr;
-use tokenizer::TokenizerManager;
-use std::num::ParseIntError;
-use core::Index;
+use tantivy_query_grammar::{UserInputAST, UserInputBound, UserInputLeaf};
 
 /// Possible error that may happen when parsing a query.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Fail)]
 pub enum QueryParserError {
     /// Error in the query syntax
+    #[fail(display = "Syntax Error")]
     SyntaxError,
     /// `FieldDoesNotExist(field_name: String)`
     /// The query references a field that is not in the schema
+    #[fail(display = "File does not exists: '{:?}'", _0)]
     FieldDoesNotExist(String),
-    /// The query contains a term for a `u64`-field, but the value
-    /// is not a u64.
+    /// The query contains a term for a `u64` or `i64`-field, but the value
+    /// is neither.
+    #[fail(display = "Expected a valid integer: '{:?}'", _0)]
     ExpectedInt(ParseIntError),
+    /// The query contains a term for a `f64`-field, but the value
+    /// is not a f64.
+    #[fail(display = "Invalid query: Only excluding terms given")]
+    ExpectedFloat(ParseFloatError),
     /// It is forbidden queries that are only "excluding". (e.g. -title:pop)
+    #[fail(display = "Invalid query: Only excluding terms given")]
     AllButQueryForbidden,
     /// If no default field is declared, running a query without any
     /// field specified is forbbidden.
+    #[fail(display = "No default field declared and no field specified in query")]
     NoDefaultFieldDeclared,
     /// The field searched for is not declared
     /// as indexed in the schema.
+    #[fail(display = "The field '{:?}' is not declared as indexed", _0)]
     FieldNotIndexed(String),
+    /// A phrase query was requested for a field that does not
+    /// have any positions indexed.
+    #[fail(display = "The field '{:?}' does not have positions indexed", _0)]
+    FieldDoesNotHavePositionsIndexed(String),
     /// The tokenizer for the given field is unknown
     /// The two argument strings are the name of the field, the name of the tokenizer
+    #[fail(
+        display = "The tokenizer '{:?}' for the field '{:?}' is unknown",
+        _0, _1
+    )]
     UnknownTokenizer(String, String),
+    /// The query contains a range query with a phrase as one of the bounds.
+    /// Only terms can be used as bounds.
+    #[fail(display = "A range query cannot have a phrase as one of the bounds")]
+    RangeMustNotHavePhrase,
+    /// The format for the date field is not RFC 3339 compliant.
+    #[fail(display = "The date field has an invalid format")]
+    DateFormatError(chrono::ParseError),
 }
-
 
 impl From<ParseIntError> for QueryParserError {
     fn from(err: ParseIntError) -> QueryParserError {
         QueryParserError::ExpectedInt(err)
+    }
+}
+
+impl From<ParseFloatError> for QueryParserError {
+    fn from(err: ParseFloatError) -> QueryParserError {
+        QueryParserError::ExpectedFloat(err)
+    }
+}
+
+impl From<chrono::ParseError> for QueryParserError {
+    fn from(err: chrono::ParseError) -> QueryParserError {
+        QueryParserError::DateFormatError(err)
+    }
+}
+
+/// Recursively remove empty clause from the AST
+///
+/// Returns `None` iff the `logical_ast` ended up being empty.
+fn trim_ast(logical_ast: LogicalAST) -> Option<LogicalAST> {
+    match logical_ast {
+        LogicalAST::Clause(children) => {
+            let trimmed_children = children
+                .into_iter()
+                .flat_map(|(occur, child)| {
+                    trim_ast(child).map(|trimmed_child| (occur, trimmed_child))
+                })
+                .collect::<Vec<_>>();
+            if trimmed_children.is_empty() {
+                None
+            } else {
+                Some(LogicalAST::Clause(trimmed_children))
+            }
+        }
+        _ => Some(logical_ast),
     }
 }
 
@@ -50,8 +113,9 @@ impl From<ParseIntError> for QueryParserError {
 /// The language covered by the current parser is extremely simple.
 ///
 /// * simple terms: "e.g.: `Barack Obama` are simply tokenized using
-///   tantivy's `StandardTokenizer`, hence becoming `["barack", "obama"]`.
-///   The terms are then searched within the default terms of the query parser.
+///   tantivy's [`SimpleTokenizer`](../tokenizer/struct.SimpleTokenizer.html), hence
+///   becoming `["barack", "obama"]`. The terms are then searched within
+///   the default terms of the query parser.
 ///
 ///   e.g. If `body` and `title` are default fields, our example terms are
 ///   `["title:barack", "body:barack", "title:obama", "body:obama"]`.
@@ -64,8 +128,17 @@ impl From<ParseIntError> for QueryParserError {
 ///   by relevance : The user typically just scans through the first few
 ///   documents in order of decreasing relevance and will stop when the documents
 ///   are not relevant anymore.
-///   Making it possible to make this behavior customizable is tracked in
-///   [issue #27](https://github.com/fulmicoton/tantivy/issues/27).
+///
+///   Switching to a default of `AND` can be done by calling `.set_conjunction_by_default()`.
+///
+///
+/// * boolean operators `AND`, `OR`. `AND` takes precedence over `OR`, so that `a AND b OR c` is interpreted
+/// as `(a AND b) OR c`.
+///
+/// * In addition to the boolean operators, the `-`, `+` can help define. These operators
+///   are sufficient to express all queries using boolean operators. For instance `x AND y OR z` can
+///   be written (`(+x +y) z`). In addition, these operators can help define "required optional"
+///   queries. `(+x y)` matches the same document set as simply `x`, but `y` will help refining the score.
 ///
 /// * negative terms: By prepending a term by a `-`, a term can be excluded
 ///   from the search. This is useful for disambiguating a query.
@@ -73,11 +146,43 @@ impl From<ParseIntError> for QueryParserError {
 ///
 /// * must terms: By prepending a term by a `+`, a term can be made required for the search.
 ///
+/// * phrase terms: Quoted terms become phrase searches on fields that have positions indexed.
+///   e.g., `title:"Barack Obama"` will only find documents that have "barack" immediately followed
+///   by "obama".
+///
+/// * range terms: Range searches can be done by specifying the start and end bound. These can be
+///   inclusive or exclusive. e.g., `title:[a TO c}` will find all documents whose title contains
+///   a word lexicographically between `a` and `c` (inclusive lower bound, exclusive upper bound).
+///   Inclusive bounds are `[]`, exclusive are `{}`.
+///
+/// * date values: The query parser supports rfc3339 formatted dates. For example "2002-10-02T15:00:00.05Z"
+///
+/// *  all docs query: A plain `*` will match all documents in the index.
+///
+/// Parts of the queries can be boosted by appending `^boostfactor`.
+/// For instance, `"SRE"^2.0 OR devops^0.4` will boost documents containing `SRE` instead of
+/// devops. Negative boosts are not allowed.
+///
+/// It is also possible to define a boost for a some specific field, at the query parser level.
+/// (See [`set_boost(...)`](#method.set_field_boost) ). Typically you may want to boost a title
+/// field.
+#[derive(Clone)]
 pub struct QueryParser {
     schema: Schema,
     default_fields: Vec<Field>,
     conjunction_by_default: bool,
     tokenizer_manager: TokenizerManager,
+    boost: HashMap<Field, f32>,
+}
+
+fn all_negative(ast: &LogicalAST) -> bool {
+    match ast {
+        LogicalAST::Leaf(_) => false,
+        LogicalAST::Boost(ref child_ast, _) => all_negative(&*child_ast),
+        LogicalAST::Clause(children) => children
+            .iter()
+            .all(|(ref occur, child)| (*occur == Occur::MustNot) || all_negative(child)),
+    }
 }
 
 impl QueryParser {
@@ -93,8 +198,9 @@ impl QueryParser {
         QueryParser {
             schema,
             default_fields,
-            tokenizer_manager: tokenizer_manager,
+            tokenizer_manager,
             conjunction_by_default: false,
+            boost: Default::default(),
         }
     }
 
@@ -102,7 +208,7 @@ impl QueryParser {
     ///  * an index
     ///  * a set of default - fields used to search if no field is specifically defined
     ///   in the query.
-    pub fn for_index(index: Index, default_fields: Vec<Field>) -> QueryParser {
+    pub fn for_index(index: &Index, default_fields: Vec<Field>) -> QueryParser {
         QueryParser::new(index.schema(), default_fields, index.tokenizers().clone())
     }
 
@@ -115,6 +221,17 @@ impl QueryParser {
         self.conjunction_by_default = true;
     }
 
+    /// Sets a boost for a specific field.
+    ///
+    /// The parse query will automatically boost this field.
+    ///
+    /// If the query defines a query boost through the query language (e.g: `country:France^3.0`),
+    /// the two boosts (the one defined in the query, and the one defined in the `QueryParser`)
+    /// are multiplied together.
+    pub fn set_field_boost(&mut self, field: Field, boost: f32) {
+        self.boost.insert(field, boost);
+    }
+
     /// Parse a query
     ///
     /// Note that `parse_query` returns an error if the input
@@ -125,42 +242,45 @@ impl QueryParser {
     ///
     /// Implementing a lenient mode for this query parser is tracked
     /// in [Issue 5](https://github.com/fulmicoton/tantivy/issues/5)
-    pub fn parse_query(&mut self, query: &str) -> Result<Box<Query>, QueryParserError> {
+    pub fn parse_query(&self, query: &str) -> Result<Box<dyn Query>, QueryParserError> {
         let logical_ast = self.parse_query_to_logical_ast(query)?;
         Ok(convert_to_query(logical_ast))
     }
 
     /// Parse the user query into an AST.
     fn parse_query_to_logical_ast(&self, query: &str) -> Result<LogicalAST, QueryParserError> {
-        let (user_input_ast, _remaining) = parse_to_ast(query).map_err(
-            |_| QueryParserError::SyntaxError,
-        )?;
+        let user_input_ast =
+            tantivy_query_grammar::parse_query(query).map_err(|_| QueryParserError::SyntaxError)?;
         self.compute_logical_ast(user_input_ast)
     }
 
     fn resolve_field_name(&self, field_name: &str) -> Result<Field, QueryParserError> {
-        self.schema.get_field(field_name).ok_or_else(|| {
-            QueryParserError::FieldDoesNotExist(String::from(field_name))
-        })
+        self.schema
+            .get_field(field_name)
+            .ok_or_else(|| QueryParserError::FieldDoesNotExist(String::from(field_name)))
     }
-
 
     fn compute_logical_ast(
         &self,
         user_input_ast: UserInputAST,
     ) -> Result<LogicalAST, QueryParserError> {
-        let (occur, ast) = self.compute_logical_ast_with_occur(user_input_ast)?;
-        if occur == Occur::MustNot {
+        let ast = self.compute_logical_ast_with_occur(user_input_ast)?;
+        if let LogicalAST::Clause(children) = &ast {
+            if children.is_empty() {
+                return Ok(ast);
+            }
+        }
+        if all_negative(&ast) {
             return Err(QueryParserError::AllButQueryForbidden);
         }
         Ok(ast)
     }
-    fn compute_logical_ast_for_leaf(
+
+    fn compute_terms_for_string(
         &self,
         field: Field,
         phrase: &str,
-    ) -> Result<Option<LogicalLiteral>, QueryParserError> {
-
+    ) -> Result<Vec<(usize, Term)>, QueryParserError> {
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
         if !field_type.is_indexed() {
@@ -171,37 +291,62 @@ impl QueryParser {
             FieldType::I64(_) => {
                 let val: i64 = i64::from_str(phrase)?;
                 let term = Term::from_field_i64(field, val);
-                Ok(Some(LogicalLiteral::Term(term)))
+                Ok(vec![(0, term)])
             }
+            FieldType::F64(_) => {
+                let val: f64 = f64::from_str(phrase)?;
+                let term = Term::from_field_f64(field, val);
+                Ok(vec![(0, term)])
+            }
+            FieldType::Date(_) => match chrono::DateTime::parse_from_rfc3339(phrase) {
+                Ok(x) => Ok(vec![(
+                    0,
+                    Term::from_field_date(field, &x.with_timezone(&chrono::Utc)),
+                )]),
+                Err(e) => Err(QueryParserError::DateFormatError(e)),
+            },
             FieldType::U64(_) => {
                 let val: u64 = u64::from_str(phrase)?;
                 let term = Term::from_field_u64(field, val);
-                Ok(Some(LogicalLiteral::Term(term)))
+                Ok(vec![(0, term)])
             }
             FieldType::Str(ref str_options) => {
                 if let Some(option) = str_options.get_indexing_options() {
-                    let mut tokenizer = self.tokenizer_manager.get(option.tokenizer()).ok_or_else(
-                        || {
-                            QueryParserError::UnknownTokenizer(
-                                field_entry.name().to_string(),
-                                option.tokenizer().to_string(),
-                            )
-                        },
-                    )?;
-                    let mut terms: Vec<Term> = Vec::new();
+                    let tokenizer =
+                        self.tokenizer_manager
+                            .get(option.tokenizer())
+                            .ok_or_else(|| {
+                                QueryParserError::UnknownTokenizer(
+                                    field_entry.name().to_string(),
+                                    option.tokenizer().to_string(),
+                                )
+                            })?;
+                    let mut terms: Vec<(usize, Term)> = Vec::new();
                     let mut token_stream = tokenizer.token_stream(phrase);
                     token_stream.process(&mut |token| {
                         let term = Term::from_field_text(field, &token.text);
-                        terms.push(term);
+                        terms.push((token.position, term));
                     });
                     if terms.is_empty() {
-                        Ok(None)
+                        Ok(vec![])
                     } else if terms.len() == 1 {
-                        Ok(Some(
-                            LogicalLiteral::Term(terms.into_iter().next().unwrap()),
-                        ))
+                        Ok(terms)
                     } else {
-                        Ok(Some(LogicalLiteral::Phrase(terms)))
+                        let field_entry = self.schema.get_field_entry(field);
+                        let field_type = field_entry.field_type();
+                        if let Some(index_record_option) = field_type.get_index_record_option() {
+                            if index_record_option.has_positions() {
+                                Ok(terms)
+                            } else {
+                                let fieldname = self.schema.get_field_name(field).to_string();
+                                Err(QueryParserError::FieldDoesNotHavePositionsIndexed(
+                                    fieldname,
+                                ))
+                            }
+                        } else {
+                            let fieldname = self.schema.get_field_name(field).to_string();
+                            Err(QueryParserError::FieldNotIndexed(fieldname))
+                        }
                     }
                 } else {
                     // This should have been seen earlier really.
@@ -210,8 +355,28 @@ impl QueryParser {
                     ))
                 }
             }
+            FieldType::HierarchicalFacet => {
+                let facet = Facet::from_text(phrase);
+                Ok(vec![(0, Term::from_field_text(field, facet.encoded_str()))])
+            }
+            FieldType::Bytes => {
+                let field_name = self.schema.get_field_name(field).to_string();
+                Err(QueryParserError::FieldNotIndexed(field_name))
+            }
         }
+    }
 
+    fn compute_logical_ast_for_leaf(
+        &self,
+        field: Field,
+        phrase: &str,
+    ) -> Result<Option<LogicalLiteral>, QueryParserError> {
+        let terms = self.compute_terms_for_string(field, phrase)?;
+        match &terms[..] {
+            [] => Ok(None),
+            [(_, term)] => Ok(Some(LogicalLiteral::Term(term.clone()))),
+            _ => Ok(Some(LogicalLiteral::Phrase(terms.clone()))),
+        }
     }
 
     fn default_occur(&self) -> Occur {
@@ -222,32 +387,75 @@ impl QueryParser {
         }
     }
 
+    fn resolve_bound(
+        &self,
+        field: Field,
+        bound: &UserInputBound,
+    ) -> Result<Bound<Term>, QueryParserError> {
+        if bound.term_str() == "*" {
+            return Ok(Bound::Unbounded);
+        }
+        let terms = self.compute_terms_for_string(field, bound.term_str())?;
+        if terms.len() != 1 {
+            return Err(QueryParserError::RangeMustNotHavePhrase);
+        }
+        let (_, term) = terms.into_iter().next().unwrap();
+        match *bound {
+            UserInputBound::Inclusive(_) => Ok(Bound::Included(term)),
+            UserInputBound::Exclusive(_) => Ok(Bound::Excluded(term)),
+            UserInputBound::Unbounded => Ok(Bound::Unbounded),
+        }
+    }
+
+    fn resolved_fields(
+        &self,
+        given_field: &Option<String>,
+    ) -> Result<Cow<'_, [Field]>, QueryParserError> {
+        match *given_field {
+            None => {
+                if self.default_fields.is_empty() {
+                    Err(QueryParserError::NoDefaultFieldDeclared)
+                } else {
+                    Ok(Cow::from(&self.default_fields[..]))
+                }
+            }
+            Some(ref field) => Ok(Cow::from(vec![self.resolve_field_name(&*field)?])),
+        }
+    }
 
     fn compute_logical_ast_with_occur(
         &self,
         user_input_ast: UserInputAST,
-    ) -> Result<(Occur, LogicalAST), QueryParserError> {
-
+    ) -> Result<LogicalAST, QueryParserError> {
         match user_input_ast {
             UserInputAST::Clause(sub_queries) => {
                 let default_occur = self.default_occur();
                 let mut logical_sub_queries: Vec<(Occur, LogicalAST)> = Vec::new();
-                for sub_query in sub_queries {
-                    let (occur, sub_ast) = self.compute_logical_ast_with_occur(*sub_query)?;
-                    let new_occur = compose_occur(default_occur, occur);
-                    logical_sub_queries.push((new_occur, sub_ast));
+                for (occur_opt, sub_ast) in sub_queries {
+                    let sub_ast = self.compute_logical_ast_with_occur(sub_ast)?;
+                    let occur = occur_opt.unwrap_or(default_occur);
+                    logical_sub_queries.push((occur, sub_ast));
                 }
-                Ok((Occur::Should, LogicalAST::Clause(logical_sub_queries)))
+                Ok(LogicalAST::Clause(logical_sub_queries))
             }
-            UserInputAST::Not(subquery) => {
-                let (occur, logical_sub_queries) = self.compute_logical_ast_with_occur(*subquery)?;
-                Ok((compose_occur(Occur::MustNot, occur), logical_sub_queries))
+            UserInputAST::Boost(ast, boost) => {
+                let ast = self.compute_logical_ast_with_occur(*ast)?;
+                Ok(ast.boost(boost))
             }
-            UserInputAST::Must(subquery) => {
-                let (occur, logical_sub_queries) = self.compute_logical_ast_with_occur(*subquery)?;
-                Ok((compose_occur(Occur::Must, occur), logical_sub_queries))
-            }
-            UserInputAST::Leaf(literal) => {
+            UserInputAST::Leaf(leaf) => self.compute_logical_ast_from_leaf(*leaf),
+        }
+    }
+
+    fn field_boost(&self, field: Field) -> f32 {
+        self.boost.get(&field).cloned().unwrap_or(1.0f32)
+    }
+
+    fn compute_logical_ast_from_leaf(
+        &self,
+        leaf: UserInputLeaf,
+    ) -> Result<LogicalAST, QueryParserError> {
+        match leaf {
+            UserInputLeaf::Literal(literal) => {
                 let term_phrases: Vec<(Field, String)> = match literal.field_name {
                     Some(ref field_name) => {
                         let field = self.resolve_field_name(field_name)?;
@@ -267,92 +475,152 @@ impl QueryParser {
                 let mut asts: Vec<LogicalAST> = Vec::new();
                 for (field, phrase) in term_phrases {
                     if let Some(ast) = self.compute_logical_ast_for_leaf(field, &phrase)? {
-                        asts.push(LogicalAST::Leaf(box ast));
+                        // Apply some field specific boost defined at the query parser level.
+                        let boost = self.field_boost(field);
+                        asts.push(LogicalAST::Leaf(Box::new(ast)).boost(boost));
                     }
                 }
-                let result_ast = if asts.is_empty() {
-                    // this should never happen
-                    return Err(QueryParserError::SyntaxError);
-                } else if asts.len() == 1 {
-                    asts[0].clone()
+                let result_ast: LogicalAST = if asts.len() == 1 {
+                    asts.into_iter().next().unwrap()
                 } else {
                     LogicalAST::Clause(asts.into_iter().map(|ast| (Occur::Should, ast)).collect())
                 };
-                Ok((Occur::Should, result_ast))
+                Ok(result_ast)
+            }
+            UserInputLeaf::All => Ok(LogicalAST::Leaf(Box::new(LogicalLiteral::All))),
+            UserInputLeaf::Range {
+                field,
+                lower,
+                upper,
+            } => {
+                let fields = self.resolved_fields(&field)?;
+                let mut clauses = fields
+                    .iter()
+                    .map(|&field| {
+                        let boost = self.field_boost(field);
+                        let field_entry = self.schema.get_field_entry(field);
+                        let value_type = field_entry.field_type().value_type();
+                        let logical_ast = LogicalAST::Leaf(Box::new(LogicalLiteral::Range {
+                            field,
+                            value_type,
+                            lower: self.resolve_bound(field, &lower)?,
+                            upper: self.resolve_bound(field, &upper)?,
+                        }));
+                        Ok(logical_ast.boost(boost))
+                    })
+                    .collect::<Result<Vec<_>, QueryParserError>>()?;
+                let result_ast = if clauses.len() == 1 {
+                    clauses.pop().unwrap()
+                } else {
+                    LogicalAST::Clause(
+                        clauses
+                            .into_iter()
+                            .map(|clause| (Occur::Should, clause))
+                            .collect(),
+                    )
+                };
+                Ok(result_ast)
             }
         }
     }
 }
 
-/// Compose two occur values.
-fn compose_occur(left: Occur, right: Occur) -> Occur {
-    match left {
-        Occur::Should => right,
-        Occur::Must => {
-            if right == Occur::MustNot {
-                Occur::MustNot
-            } else {
-                Occur::Must
-            }
-        }
-        Occur::MustNot => {
-            if right == Occur::MustNot {
-                Occur::Must
-            } else {
-                Occur::MustNot
-            }
-        }
-    }
-}
-
-fn convert_literal_to_query(logical_literal: LogicalLiteral) -> Box<Query> {
+fn convert_literal_to_query(logical_literal: LogicalLiteral) -> Box<dyn Query> {
     match logical_literal {
-        LogicalLiteral::Term(term) => box TermQuery::new(term, IndexRecordOption::WithFreqs),
-        LogicalLiteral::Phrase(terms) => box PhraseQuery::from(terms),
+        LogicalLiteral::Term(term) => Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
+        LogicalLiteral::Phrase(term_with_offsets) => {
+            Box::new(PhraseQuery::new_with_offset(term_with_offsets))
+        }
+        LogicalLiteral::Range {
+            field,
+            value_type,
+            lower,
+            upper,
+        } => Box::new(RangeQuery::new_term_bounds(
+            field, value_type, &lower, &upper,
+        )),
+        LogicalLiteral::All => Box::new(AllQuery),
     }
 }
 
-fn convert_to_query(logical_ast: LogicalAST) -> Box<Query> {
-    match logical_ast {
-        LogicalAST::Clause(clause) => {
-            let occur_subqueries = clause
+fn convert_to_query(logical_ast: LogicalAST) -> Box<dyn Query> {
+    match trim_ast(logical_ast) {
+        Some(LogicalAST::Clause(trimmed_clause)) => {
+            let occur_subqueries = trimmed_clause
                 .into_iter()
                 .map(|(occur, subquery)| (occur, convert_to_query(subquery)))
                 .collect::<Vec<_>>();
-            box BooleanQuery::from(occur_subqueries)
+            assert!(
+                !occur_subqueries.is_empty(),
+                "Should not be empty after trimming"
+            );
+            Box::new(BooleanQuery::from(occur_subqueries))
         }
-        LogicalAST::Leaf(logical_literal) => convert_literal_to_query(*logical_literal),
+        Some(LogicalAST::Leaf(trimmed_logical_literal)) => {
+            convert_literal_to_query(*trimmed_logical_literal)
+        }
+        Some(LogicalAST::Boost(ast, boost)) => {
+            let query = convert_to_query(*ast);
+            let boosted_query = BoostQuery::new(query, boost);
+            Box::new(boosted_query)
+        }
+        None => Box::new(EmptyQuery),
     }
 }
 
-
-
 #[cfg(test)]
 mod test {
-    use schema::{SchemaBuilder, Term, TEXT, STRING, STORED, INT_INDEXED};
-    use tokenizer::TokenizerManager;
-    use query::Query;
-    use schema::Field;
+    use super::super::logical_ast::*;
     use super::QueryParser;
     use super::QueryParserError;
-    use super::super::logical_ast::*;
+    use crate::query::Query;
+    use crate::schema::Field;
+    use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+    use crate::schema::{Schema, Term, INDEXED, STORED, STRING, TEXT};
+    use crate::tokenizer::{
+        LowerCaser, SimpleTokenizer, StopWordFilter, TextAnalyzer, TokenizerManager,
+    };
+    use crate::Index;
+    use matches::assert_matches;
 
-    fn make_query_parser() -> QueryParser {
-        let mut schema_builder = SchemaBuilder::default();
-        let title = schema_builder.add_text_field("title", TEXT);
-        let text = schema_builder.add_text_field("text", TEXT);
-        schema_builder.add_i64_field("signed", INT_INDEXED);
-        schema_builder.add_u64_field("unsigned", INT_INDEXED);
+    fn make_schema() -> Schema {
+        let mut schema_builder = Schema::builder();
+        let text_field_indexing = TextFieldIndexing::default()
+            .set_tokenizer("en_with_stop_words")
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        let text_options = TextOptions::default()
+            .set_indexing_options(text_field_indexing)
+            .set_stored();
+        schema_builder.add_text_field("title", TEXT);
+        schema_builder.add_text_field("text", TEXT);
+        schema_builder.add_i64_field("signed", INDEXED);
+        schema_builder.add_u64_field("unsigned", INDEXED);
         schema_builder.add_text_field("notindexed_text", STORED);
         schema_builder.add_text_field("notindexed_u64", STORED);
         schema_builder.add_text_field("notindexed_i64", STORED);
         schema_builder.add_text_field("nottokenized", STRING);
-        let schema = schema_builder.build();
-        let default_fields = vec![title, text];
-        let tokenizer_manager = TokenizerManager::default();
-        QueryParser::new(schema, default_fields, tokenizer_manager)
+        schema_builder.add_text_field("with_stop_words", text_options);
+        schema_builder.add_date_field("date", INDEXED);
+        schema_builder.add_f64_field("float", INDEXED);
+        schema_builder.add_facet_field("facet");
+        schema_builder.build()
     }
 
+    fn make_query_parser() -> QueryParser {
+        let schema = make_schema();
+        let default_fields: Vec<Field> = vec!["title", "text"]
+            .into_iter()
+            .flat_map(|field_name| schema.get_field(field_name))
+            .collect();
+        let tokenizer_manager = TokenizerManager::default();
+        tokenizer_manager.register(
+            "en_with_stop_words",
+            TextAnalyzer::from(SimpleTokenizer)
+                .filter(LowerCaser)
+                .filter(StopWordFilter::remove(vec!["the".to_string()])),
+        );
+        QueryParser::new(schema, default_fields, tokenizer_manager)
+    }
 
     fn parse_query_to_logical_ast(
         query: &str,
@@ -375,19 +643,61 @@ mod test {
         assert_eq!(query_str, expected);
     }
 
+    #[test]
+    pub fn test_parse_query_facet() {
+        let query_parser = make_query_parser();
+        let query = query_parser.parse_query("facet:/root/branch/leaf").unwrap();
+        assert_eq!(
+            format!("{:?}", query),
+            "TermQuery(Term(field=11,bytes=[114, 111, 111, 116, 0, 98, 114, 97, 110, 99, 104, 0, 108, 101, 97, 102]))"
+        );
+    }
 
     #[test]
-    pub fn test_parse_query_simple() {
+    pub fn test_parse_query_with_boost() {
         let mut query_parser = make_query_parser();
-        assert!(query_parser.parse_query("toto").is_ok());
+        let schema = make_schema();
+        let text_field = schema.get_field("text").unwrap();
+        query_parser.set_field_boost(text_field, 2.0f32);
+        let query = query_parser.parse_query("text:hello").unwrap();
+        assert_eq!(
+            format!("{:?}", query),
+            "Boost(query=TermQuery(Term(field=1,bytes=[104, 101, 108, 108, 111])), boost=2)"
+        );
+    }
+
+    #[test]
+    pub fn test_parse_query_range_with_boost() {
+        let mut query_parser = make_query_parser();
+        let schema = make_schema();
+        let title_field = schema.get_field("title").unwrap();
+        query_parser.set_field_boost(title_field, 2.0f32);
+        let query = query_parser.parse_query("title:[A TO B]").unwrap();
+        assert_eq!(
+            format!("{:?}", query),
+            "Boost(query=RangeQuery { field: Field(0), value_type: Str, left_bound: Included([97]), right_bound: Included([98]) }, boost=2)"
+        );
+    }
+
+    #[test]
+    pub fn test_parse_query_with_default_boost_and_custom_boost() {
+        let mut query_parser = make_query_parser();
+        let schema = make_schema();
+        let text_field = schema.get_field("text").unwrap();
+        query_parser.set_field_boost(text_field, 2.0f32);
+        let query = query_parser.parse_query("text:hello^2").unwrap();
+        assert_eq!(
+            format!("{:?}", query),
+            "Boost(query=Boost(query=TermQuery(Term(field=1,bytes=[104, 101, 108, 108, 111])), boost=2), boost=2)"
+        );
     }
 
     #[test]
     pub fn test_parse_nonindexed_field_yields_error() {
-        let mut query_parser = make_query_parser();
+        let query_parser = make_query_parser();
 
-        let mut is_not_indexed_err = |query: &str| {
-            let result: Result<Box<Query>, QueryParserError> = query_parser.parse_query(query);
+        let is_not_indexed_err = |query: &str| {
+            let result: Result<Box<dyn Query>, QueryParserError> = query_parser.parse_query(query);
             if let Err(QueryParserError::FieldNotIndexed(field_name)) = result {
                 Some(field_name.clone())
             } else {
@@ -409,92 +719,285 @@ mod test {
         );
     }
 
-
     #[test]
     pub fn test_parse_query_untokenized() {
         test_parse_query_to_logical_ast_helper(
             "nottokenized:\"wordone wordtwo\"",
-            "Term([0, 0, 0, 7, 119, 111, 114, 100, 111, 110, \
-                                               101, 32, 119, 111, 114, 100, 116, 119, 111])",
+            "Term(field=7,bytes=[119, 111, 114, 100, 111, 110, \
+             101, 32, 119, 111, 114, 100, 116, 119, 111])",
             false,
         );
     }
 
     #[test]
+    pub fn test_parse_query_empty() {
+        test_parse_query_to_logical_ast_helper("", "<emptyclause>", false);
+        test_parse_query_to_logical_ast_helper(" ", "<emptyclause>", false);
+        let query_parser = make_query_parser();
+        let query_result = query_parser.parse_query("");
+        let query = query_result.unwrap();
+        assert_eq!(format!("{:?}", query), "EmptyQuery");
+    }
+
+    #[test]
     pub fn test_parse_query_ints() {
-        let mut query_parser = make_query_parser();
+        let query_parser = make_query_parser();
         assert!(query_parser.parse_query("signed:2324").is_ok());
         assert!(query_parser.parse_query("signed:\"22\"").is_ok());
         assert!(query_parser.parse_query("signed:\"-2234\"").is_ok());
-        assert!(
-            query_parser
-                .parse_query("signed:\"-9999999999999\"")
-                .is_ok()
-        );
+        assert!(query_parser
+            .parse_query("signed:\"-9999999999999\"")
+            .is_ok());
         assert!(query_parser.parse_query("signed:\"a\"").is_err());
         assert!(query_parser.parse_query("signed:\"2a\"").is_err());
-        assert!(
-            query_parser
-                .parse_query("signed:\"18446744073709551615\"")
-                .is_err()
-        );
+        assert!(query_parser
+            .parse_query("signed:\"18446744073709551615\"")
+            .is_err());
         assert!(query_parser.parse_query("unsigned:\"2\"").is_ok());
         assert!(query_parser.parse_query("unsigned:\"-2\"").is_err());
-        assert!(
-            query_parser
-                .parse_query("unsigned:\"18446744073709551615\"")
-                .is_ok()
-        );
+        assert!(query_parser
+            .parse_query("unsigned:\"18446744073709551615\"")
+            .is_ok());
+        assert!(query_parser.parse_query("float:\"3.1\"").is_ok());
+        assert!(query_parser.parse_query("float:\"-2.4\"").is_ok());
+        assert!(query_parser.parse_query("float:\"2.1.2\"").is_err());
+        assert!(query_parser.parse_query("float:\"2.1a\"").is_err());
+        assert!(query_parser
+            .parse_query("float:\"18446744073709551615.0\"")
+            .is_ok());
         test_parse_query_to_logical_ast_helper(
             "unsigned:2324",
-            "Term([0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 9, 20])",
+            "Term(field=3,bytes=[0, 0, 0, 0, 0, 0, 9, 20])",
             false,
         );
 
         test_parse_query_to_logical_ast_helper(
             "signed:-2324",
-            &format!("{:?}", Term::from_field_i64(Field(2u32), -2324)),
+            &format!(
+                "{:?}",
+                Term::from_field_i64(Field::from_field_id(2u32), -2324)
+            ),
+            false,
+        );
+
+        test_parse_query_to_logical_ast_helper(
+            "float:2.5",
+            &format!(
+                "{:?}",
+                Term::from_field_f64(Field::from_field_id(10u32), 2.5)
+            ),
             false,
         );
     }
 
+    #[test]
+    fn test_parse_query_to_ast_ab_c() {
+        test_parse_query_to_logical_ast_helper(
+            "(+title:a +title:b) title:c",
+            "((+Term(field=0,bytes=[97]) +Term(field=0,bytes=[98])) Term(field=0,bytes=[99]))",
+            false,
+        );
+        test_parse_query_to_logical_ast_helper(
+            "(+title:a +title:b) title:c",
+            "(+(+Term(field=0,bytes=[97]) +Term(field=0,bytes=[98])) +Term(field=0,bytes=[99]))",
+            true,
+        );
+    }
 
     #[test]
-    pub fn test_parse_query_to_ast_disjunction() {
+    pub fn test_parse_query_to_ast_single_term() {
         test_parse_query_to_logical_ast_helper(
             "title:toto",
-            "Term([0, 0, 0, 0, 116, 111, 116, 111])",
+            "Term(field=0,bytes=[116, 111, 116, 111])",
             false,
         );
         test_parse_query_to_logical_ast_helper(
             "+title:toto",
-            "Term([0, 0, 0, 0, 116, 111, 116, 111])",
+            "Term(field=0,bytes=[116, 111, 116, 111])",
             false,
         );
         test_parse_query_to_logical_ast_helper(
             "+title:toto -titi",
-            "(+Term([0, 0, 0, 0, 116, 111, 116, 111]) \
-                                                 -(Term([0, 0, 0, 0, 116, 105, 116, 105]) \
-                                                   Term([0, 0, 0, 1, 116, 105, 116, 105])))",
+            "(+Term(field=0,bytes=[116, 111, 116, 111]) \
+             -(Term(field=0,bytes=[116, 105, 116, 105]) \
+             Term(field=1,bytes=[116, 105, 116, 105])))",
             false,
         );
-        assert_eq!(
-            parse_query_to_logical_ast("-title:toto", false)
-                .err()
-                .unwrap(),
-            QueryParserError::AllButQueryForbidden
+    }
+
+    #[test]
+    fn test_single_negative_term() {
+        assert_matches!(
+            parse_query_to_logical_ast("-title:toto", false),
+            Err(QueryParserError::AllButQueryForbidden)
         );
+    }
+
+    #[test]
+    pub fn test_parse_query_to_ast_two_terms() {
         test_parse_query_to_logical_ast_helper(
             "title:a b",
-            "(Term([0, 0, 0, 0, 97]) (Term([0, 0, 0, 0, 98]) \
-                                                 Term([0, 0, 0, 1, 98])))",
+            "(Term(field=0,bytes=[97]) (Term(field=0,bytes=[98]) Term(field=1,bytes=[98])))",
             false,
         );
         test_parse_query_to_logical_ast_helper(
             "title:\"a b\"",
-            "\"[Term([0, 0, 0, 0, 97]), \
-                                                   Term([0, 0, 0, 0, 98])]\"",
+            "\"[(0, Term(field=0,bytes=[97])), \
+             (1, Term(field=0,bytes=[98]))]\"",
             false,
+        );
+    }
+
+    #[test]
+    pub fn test_parse_query_to_ast_ranges() {
+        test_parse_query_to_logical_ast_helper(
+            "title:[a TO b]",
+            "(Included(Term(field=0,bytes=[97])) TO Included(Term(field=0,bytes=[98])))",
+            false,
+        );
+        test_parse_query_to_logical_ast_helper(
+            "[a TO b]",
+            "((Included(Term(field=0,bytes=[97])) TO \
+             Included(Term(field=0,bytes=[98]))) \
+             (Included(Term(field=1,bytes=[97])) TO \
+             Included(Term(field=1,bytes=[98]))))",
+            false,
+        );
+        test_parse_query_to_logical_ast_helper(
+            "title:{titi TO toto}",
+            "(Excluded(Term(field=0,bytes=[116, 105, 116, 105])) TO \
+             Excluded(Term(field=0,bytes=[116, 111, 116, 111])))",
+            false,
+        );
+        test_parse_query_to_logical_ast_helper(
+            "title:{* TO toto}",
+            "(Unbounded TO Excluded(Term(field=0,bytes=[116, 111, 116, 111])))",
+            false,
+        );
+        test_parse_query_to_logical_ast_helper(
+            "title:{titi TO *}",
+            "(Excluded(Term(field=0,bytes=[116, 105, 116, 105])) TO Unbounded)",
+            false,
+        );
+        test_parse_query_to_logical_ast_helper(
+            "signed:{-5 TO 3}",
+            "(Excluded(Term(field=2,bytes=[127, 255, 255, 255, 255, 255, 255, 251])) TO \
+             Excluded(Term(field=2,bytes=[128, 0, 0, 0, 0, 0, 0, 3])))",
+            false,
+        );
+        test_parse_query_to_logical_ast_helper(
+            "float:{-1.5 TO 1.5}",
+            "(Excluded(Term(field=10,bytes=[64, 7, 255, 255, 255, 255, 255, 255])) TO \
+             Excluded(Term(field=10,bytes=[191, 248, 0, 0, 0, 0, 0, 0])))",
+            false,
+        );
+
+        test_parse_query_to_logical_ast_helper("*", "*", false);
+    }
+
+    #[test]
+    pub fn test_query_parser_field_does_not_exist() {
+        let query_parser = make_query_parser();
+        assert_matches!(
+            query_parser.parse_query("boujou:\"18446744073709551615\""),
+            Err(QueryParserError::FieldDoesNotExist(_))
+        );
+    }
+
+    #[test]
+    pub fn test_query_parser_field_not_indexed() {
+        let query_parser = make_query_parser();
+        assert_matches!(
+            query_parser.parse_query("notindexed_text:\"18446744073709551615\""),
+            Err(QueryParserError::FieldNotIndexed(_))
+        );
+    }
+
+    #[test]
+    pub fn test_unknown_tokenizer() {
+        let mut schema_builder = Schema::builder();
+        let text_field_indexing = TextFieldIndexing::default()
+            .set_tokenizer("nonexistingtokenizer")
+            .set_index_option(IndexRecordOption::Basic);
+        let text_options = TextOptions::default().set_indexing_options(text_field_indexing);
+        let title = schema_builder.add_text_field("title", text_options);
+        let schema = schema_builder.build();
+        let default_fields = vec![title];
+        let tokenizer_manager = TokenizerManager::default();
+        let query_parser = QueryParser::new(schema, default_fields, tokenizer_manager);
+        assert_matches!(
+            query_parser.parse_query("title:\"happy tax payer\""),
+            Err(QueryParserError::UnknownTokenizer(_, _))
+        );
+    }
+
+    #[test]
+    pub fn test_query_parser_no_positions() {
+        let mut schema_builder = Schema::builder();
+        let text_field_indexing = TextFieldIndexing::default()
+            .set_tokenizer("customtokenizer")
+            .set_index_option(IndexRecordOption::Basic);
+        let text_options = TextOptions::default().set_indexing_options(text_field_indexing);
+        let title = schema_builder.add_text_field("title", text_options);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        index
+            .tokenizers()
+            .register("customtokenizer", SimpleTokenizer);
+        let query_parser = QueryParser::for_index(&index, vec![title]);
+        assert_eq!(
+            query_parser.parse_query("title:\"happy tax\"").unwrap_err(),
+            QueryParserError::FieldDoesNotHavePositionsIndexed("title".to_string())
+        );
+    }
+
+    #[test]
+    pub fn test_query_parser_expected_int() {
+        let query_parser = make_query_parser();
+        assert_matches!(
+            query_parser.parse_query("unsigned:18a"),
+            Err(QueryParserError::ExpectedInt(_))
+        );
+        assert!(query_parser.parse_query("unsigned:\"18\"").is_ok());
+        assert_matches!(
+            query_parser.parse_query("signed:18b"),
+            Err(QueryParserError::ExpectedInt(_))
+        );
+        assert!(query_parser.parse_query("float:\"1.8\"").is_ok());
+        assert_matches!(
+            query_parser.parse_query("float:1.8a"),
+            Err(QueryParserError::ExpectedFloat(_))
+        );
+    }
+
+    #[test]
+    pub fn test_query_parser_expected_date() {
+        let query_parser = make_query_parser();
+        assert_matches!(
+            query_parser.parse_query("date:18a"),
+            Err(QueryParserError::DateFormatError(_))
+        );
+        assert!(query_parser
+            .parse_query("date:\"1985-04-12T23:20:50.52Z\"")
+            .is_ok());
+    }
+
+    #[test]
+    pub fn test_query_parser_not_empty_but_no_tokens() {
+        let query_parser = make_query_parser();
+        assert!(query_parser.parse_query(" !, ").is_ok());
+        assert!(query_parser.parse_query("with_stop_words:the").is_ok());
+    }
+
+    #[test]
+    pub fn test_parse_query_single_negative_term_through_error() {
+        assert_matches!(
+            parse_query_to_logical_ast("-title:toto", true),
+            Err(QueryParserError::AllButQueryForbidden)
+        );
+        assert_matches!(
+            parse_query_to_logical_ast("-title:toto", false),
+            Err(QueryParserError::AllButQueryForbidden)
         );
     }
 
@@ -502,39 +1005,64 @@ mod test {
     pub fn test_parse_query_to_ast_conjunction() {
         test_parse_query_to_logical_ast_helper(
             "title:toto",
-            "Term([0, 0, 0, 0, 116, 111, 116, 111])",
+            "Term(field=0,bytes=[116, 111, 116, 111])",
             true,
         );
         test_parse_query_to_logical_ast_helper(
             "+title:toto",
-            "Term([0, 0, 0, 0, 116, 111, 116, 111])",
+            "Term(field=0,bytes=[116, 111, 116, 111])",
             true,
         );
         test_parse_query_to_logical_ast_helper(
             "+title:toto -titi",
-            "(+Term([0, 0, 0, 0, 116, 111, 116, 111]) \
-                                                 -(Term([0, 0, 0, 0, 116, 105, 116, 105]) \
-                                                   Term([0, 0, 0, 1, 116, 105, 116, 105])))",
+            "(+Term(field=0,bytes=[116, 111, 116, 111]) \
+             -(Term(field=0,bytes=[116, 105, 116, 105]) \
+             Term(field=1,bytes=[116, 105, 116, 105])))",
             true,
-        );
-        assert_eq!(
-            parse_query_to_logical_ast("-title:toto", true)
-                .err()
-                .unwrap(),
-            QueryParserError::AllButQueryForbidden
         );
         test_parse_query_to_logical_ast_helper(
             "title:a b",
-            "(+Term([0, 0, 0, 0, 97]) \
-                                                 +(Term([0, 0, 0, 0, 98]) \
-                                                   Term([0, 0, 0, 1, 98])))",
+            "(+Term(field=0,bytes=[97]) \
+             +(Term(field=0,bytes=[98]) \
+             Term(field=1,bytes=[98])))",
             true,
         );
         test_parse_query_to_logical_ast_helper(
             "title:\"a b\"",
-            "\"[Term([0, 0, 0, 0, 97]), \
-                                                   Term([0, 0, 0, 0, 98])]\"",
+            "\"[(0, Term(field=0,bytes=[97])), \
+             (1, Term(field=0,bytes=[98]))]\"",
             true,
         );
+    }
+
+    #[test]
+    pub fn test_query_parser_hyphen() {
+        test_parse_query_to_logical_ast_helper(
+            "title:www-form-encoded",
+            "\"[(0, Term(field=0,bytes=[119, 119, 119])), (1, Term(field=0,bytes=[102, 111, 114, 109])), (2, Term(field=0,bytes=[101, 110, 99, 111, 100, 101, 100]))]\"",
+            false
+        );
+    }
+
+    #[test]
+    fn test_and_default_regardless_of_default_conjunctive() {
+        for &default_conjunction in &[false, true] {
+            test_parse_query_to_logical_ast_helper(
+                "title:a AND title:b",
+                "(+Term(field=0,bytes=[97]) +Term(field=0,bytes=[98]))",
+                default_conjunction,
+            );
+        }
+    }
+
+    #[test]
+    fn test_or_default_conjunctive() {
+        for &default_conjunction in &[false, true] {
+            test_parse_query_to_logical_ast_helper(
+                "title:a OR title:b",
+                "(Term(field=0,bytes=[97]) Term(field=0,bytes=[98]))",
+                default_conjunction,
+            );
+        }
     }
 }

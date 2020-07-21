@@ -1,9 +1,12 @@
-use std::ops::BitOr;
+use crate::schema::flags::SchemaFlagList;
+use crate::schema::flags::StoredFlag;
+use crate::schema::IndexRecordOption;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use schema::IndexRecordOption;
+use std::ops::BitOr;
 
 /// Define how a text field should be handled by tantivy.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextOptions {
     indexing: Option<TextFieldIndexing>,
     stored: bool,
@@ -33,7 +36,6 @@ impl TextOptions {
     }
 }
 
-
 impl Default for TextOptions {
     fn default() -> TextOptions {
         TextOptions {
@@ -43,13 +45,17 @@ impl Default for TextOptions {
     }
 }
 
-
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+/// Configuration defining indexing for a text field.
+///
+/// It defines
+/// - the amount of information that should be stored about the presence of a term in a document.
+/// Essentially, should we store the term frequency and/or the positions (See [`IndexRecordOption`](./enum.IndexRecordOption.html)).
+/// - the name of the `Tokenizer` that should be used to process the field.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct TextFieldIndexing {
     record: IndexRecordOption,
     tokenizer: Cow<'static, str>,
 }
-
 
 impl Default for TextFieldIndexing {
     fn default() -> TextFieldIndexing {
@@ -71,7 +77,6 @@ impl TextFieldIndexing {
     pub fn tokenizer(&self) -> &str {
         &self.tokenizer
     }
-
 
     /// Sets which information should be indexed with the tokens.
     ///
@@ -98,7 +103,6 @@ pub const STRING: TextOptions = TextOptions {
     stored: false,
 };
 
-
 /// The field will be tokenized and indexed
 pub const TEXT: TextOptions = TextOptions {
     indexing: Some(TextFieldIndexing {
@@ -108,20 +112,11 @@ pub const TEXT: TextOptions = TextOptions {
     stored: false,
 };
 
-/// A stored fields of a document can be retrieved given its `DocId`.
-/// Stored field are stored together and LZ4 compressed.
-/// Reading the stored fields of a document is relatively slow.
-/// (100 microsecs)
-pub const STORED: TextOptions = TextOptions {
-    indexing: None,
-    stored: true,
-};
-
-
-impl BitOr for TextOptions {
+impl<T: Into<TextOptions>> BitOr<T> for TextOptions {
     type Output = TextOptions;
 
-    fn bitor(self, other: TextOptions) -> TextOptions {
+    fn bitor(self, other: T) -> TextOptions {
+        let other = other.into();
         let mut res = TextOptions::default();
         res.indexing = self.indexing.or(other.indexing);
         res.stored = self.stored | other.stored;
@@ -129,37 +124,49 @@ impl BitOr for TextOptions {
     }
 }
 
+impl From<()> for TextOptions {
+    fn from(_: ()) -> TextOptions {
+        TextOptions::default()
+    }
+}
+
+impl From<StoredFlag> for TextOptions {
+    fn from(_: StoredFlag) -> TextOptions {
+        TextOptions {
+            indexing: None,
+            stored: true,
+        }
+    }
+}
+
+impl<Head, Tail> From<SchemaFlagList<Head, Tail>> for TextOptions
+where
+    Head: Clone,
+    Tail: Clone,
+    Self: BitOr<Output = Self> + From<Head> + From<Tail>,
+{
+    fn from(head_tail: SchemaFlagList<Head, Tail>) -> Self {
+        Self::from(head_tail.head) | Self::from(head_tail.tail)
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use schema::*;
+    use crate::schema::*;
 
     #[test]
     fn test_field_options() {
-        {
-            let field_options = STORED | TEXT;
-            assert!(field_options.is_stored());
-            assert!(field_options.get_indexing_options().is_some());
-        }
-        {
-            let mut schema_builder = SchemaBuilder::default();
-            schema_builder.add_text_field("body", TEXT);
-            let schema = schema_builder.build();
-            let field = schema.get_field("body").unwrap();
-            let field_entry = schema.get_field_entry(field);
-            match field_entry.field_type() {
-                &FieldType::Str(ref text_options) => {
-                    assert!(text_options.get_indexing_options().is_some());
-                    assert_eq!(
-                        text_options.get_indexing_options().unwrap().tokenizer(),
-                        "default"
-                    );
-                }
-                _ => {
-                    panic!("");
-                }
-            }
-        }
+        let field_options = STORED | TEXT;
+        assert!(field_options.is_stored());
+        assert!(field_options.get_indexing_options().is_some());
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("body", TEXT);
+        let schema = schema_builder.build();
+        let field = schema.get_field("body").unwrap();
+        let field_entry = schema.get_field_entry(field);
+        assert!(matches!(field_entry.field_type(),
+                &FieldType::Str(ref text_options)
+                if text_options.get_indexing_options().unwrap().tokenizer() == "default"));
     }
 
     #[test]

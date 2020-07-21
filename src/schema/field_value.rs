@@ -1,13 +1,10 @@
-use std::io;
-use common::BinarySerializable;
-use std::io::Read;
-use std::io::Write;
-use schema::Field;
-use schema::Value;
-
+use crate::common::BinarySerializable;
+use crate::schema::Field;
+use crate::schema::Value;
+use std::io::{self, Read, Write};
 
 /// `FieldValue` holds together a `Field` and its `Value`.
-#[derive(Debug, Clone, Ord, PartialEq, Eq, PartialOrd, Serialize, Deserialize)]
+#[derive(Debug, Clone, Ord, PartialEq, Eq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct FieldValue {
     field: Field,
     value: Value,
@@ -16,10 +13,7 @@ pub struct FieldValue {
 impl FieldValue {
     /// Constructor
     pub fn new(field: Field, value: Value) -> FieldValue {
-        FieldValue {
-            field: field,
-            value: value,
-        }
+        FieldValue { field, value }
     }
 
     /// Field accessor

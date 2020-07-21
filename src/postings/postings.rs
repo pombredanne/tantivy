@@ -1,5 +1,4 @@
-use std::borrow::Borrow;
-use postings::docset::DocSet;
+use crate::docset::DocSet;
 
 /// Postings (also called inverted list)
 ///
@@ -11,34 +10,17 @@ use postings::docset::DocSet;
 /// Its main implementation is `SegmentPostings`,
 /// but other implementations mocking `SegmentPostings` exist,
 /// for merging segments or for testing.
-pub trait Postings: DocSet {
+pub trait Postings: DocSet + 'static {
     /// Returns the term frequency
     fn term_freq(&self) -> u32;
-    /// Returns the list of positions of the term, expressed as a list of
-    /// token ordinals.
-    fn positions(&self) -> &[u32];
-}
 
-impl<TPostings: Postings> Postings for Box<TPostings> {
-    fn term_freq(&self) -> u32 {
-        let unboxed: &TPostings = self.borrow();
-        unboxed.term_freq()
-    }
+    /// Returns the positions offseted with a given value.
+    /// The output vector will be resized to the `term_freq`.
+    fn positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>);
 
-    fn positions(&self) -> &[u32] {
-        let unboxed: &TPostings = self.borrow();
-        unboxed.positions()
-    }
-}
-
-impl<'a, TPostings: Postings> Postings for &'a mut TPostings {
-    fn term_freq(&self) -> u32 {
-        let unref: &TPostings = *self;
-        unref.term_freq()
-    }
-
-    fn positions(&self) -> &[u32] {
-        let unref: &TPostings = *self;
-        unref.positions()
+    /// Returns the positions of the term in the given document.
+    /// The output vector will be resized to the `term_freq`.
+    fn positions(&mut self, output: &mut Vec<u32>) {
+        self.positions_with_offset(0u32, output);
     }
 }

@@ -1,13 +1,11 @@
-use core::SegmentId;
-use core::SegmentMeta;
-use std::marker;
+use crate::core::SegmentId;
+use crate::core::SegmentMeta;
 use std::fmt::Debug;
-
+use std::marker;
 
 /// Set of segment suggested for a merge.
 #[derive(Debug, Clone)]
 pub struct MergeCandidate(pub Vec<SegmentId>);
-
 
 /// The `MergePolicy` defines which segments should be merged.
 ///
@@ -19,12 +17,10 @@ pub trait MergePolicy: marker::Send + marker::Sync + Debug {
     /// This call happens on the segment updater thread, and will block
     /// other segment updates, so all implementations should happen rapidly.
     fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate>;
-    /// Returns a boxed clone of the MergePolicy.
-    fn box_clone(&self) -> Box<MergePolicy>;
 }
 
 /// Never merge segments.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NoMergePolicy;
 
 impl Default for NoMergePolicy {
@@ -37,26 +33,20 @@ impl MergePolicy for NoMergePolicy {
     fn compute_merge_candidates(&self, _segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
         Vec::new()
     }
-
-    fn box_clone(&self) -> Box<MergePolicy> {
-        box NoMergePolicy
-    }
 }
-
 
 #[cfg(test)]
 pub mod tests {
 
     use super::*;
-    use core::SegmentId;
-    use core::SegmentMeta;
-
+    use crate::core::SegmentId;
+    use crate::core::SegmentMeta;
 
     /// `MergePolicy` useful for test purposes.
     ///
     /// Everytime there is more than one segment,
     /// it will suggest to merge them.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct MergeWheneverPossible;
 
     impl MergePolicy for MergeWheneverPossible {
@@ -70,10 +60,6 @@ pub mod tests {
             } else {
                 vec![]
             }
-        }
-
-        fn box_clone(&self) -> Box<MergePolicy> {
-            box MergeWheneverPossible
         }
     }
 }
